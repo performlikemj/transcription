@@ -17,8 +17,9 @@ PY2APP_OPTS = dict(
     packages      = [
         # core dependencies used by the application
         "rumps", "numpy", "sounddevice", "soundfile", "_soundfile_data",
-        "pynput", "matplotlib",
-        # heavy hitters that cause deep AST-trees → skip analysis (not required for runtime)
+        "pynput", "matplotlib", "PyObjCTools",
+        # heavy hitters that cause deep AST-trees → skip analysis
+        "hydra", "numba", "llvmlite",
     ],
     # heavy hitters that cause deep AST-trees → skip analysis
     excludes      = [
