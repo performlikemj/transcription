@@ -15,11 +15,10 @@ PY2APP_OPTS = dict(
     argv_emulation= False,            # Apple-Silicon console fix
     # explicitly include only what you really need
     packages      = [
-        # core
+        # core dependencies used by the application
         "rumps", "numpy", "sounddevice", "soundfile", "_soundfile_data",
-        "pynput", "sympy", "IPython", "jedi", "PIL", "matplotlib",
-        "numba", "llvmlite", "hydra",
-        # heavy hitters that cause deep AST-trees → skip analysis
+        "pynput", "matplotlib",
+        # heavy hitters that cause deep AST-trees → skip analysis (not required for runtime)
     ],
     # heavy hitters that cause deep AST-trees → skip analysis
     excludes      = [
