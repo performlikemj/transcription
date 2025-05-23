@@ -1,1 +1,4 @@
 parakeet-tdt-0.6b-v2/
+.venv/
+build/
+dist/
