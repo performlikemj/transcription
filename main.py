@@ -1,3 +1,17 @@
+# --- macOS dylib workaround: ensure Torch's private libs are discoverable ---
+import sys, os, pathlib
+if getattr(sys, "frozen", False):  # running inside YardTalk.app
+    bundle_root = pathlib.Path(sys.executable).resolve().parents[1]  # .../Contents
+    torch_lib_dir = (
+        bundle_root
+        / "Resources"
+        / f"lib/python{sys.version_info.major}.{sys.version_info.minor}"
+        / "torch"
+        / "lib"
+    )
+    # Tell the dynamic loader where to look first for @rpath-dependent libs
+    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = str(torch_lib_dir)
+# ---------------------------------------------------------------------------
 import rumps
 from hotkey_manager import HotkeyManager
 from audio_manager import AudioManager
@@ -36,7 +50,18 @@ class DictationApp(rumps.App):
         self.audio_manager = AudioManager()
         self.waveform_visualizer = WaveformVisualizer(sample_rate=self.audio_manager.sample_rate)
         self.text_insertion_service = TextInsertionService()
-        self.asr_service = ASRService(result_callback=self._handle_asr_service_result)
+        
+        # Determine the correct model path based on whether we're in a bundled app
+        if getattr(sys, "frozen", False):  # Running in bundled app
+            # In bundled app, the model is in the Resources directory
+            bundle_root = pathlib.Path(sys.executable).resolve().parents[1]  # .../Contents
+            model_path = str(bundle_root / "Resources" / "parakeet-tdt-0.6b-v2.nemo")
+        else:
+            # Running from source
+            model_path = "parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo"
+        
+        print(f"MAIN_APP: Using model path: {model_path}")
+        self.asr_service = ASRService(model_path=model_path, result_callback=self._handle_asr_service_result)
         
         self.hotkey_manager = HotkeyManager(
             hotkey_str=self.hotkey_string,
