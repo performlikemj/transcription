@@ -1,0 +1,25 @@
+# Virtual environments
+.venv/
+.yardtalk/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Model files (too large for git)
+parakeet-tdt-0.6b-v2/
