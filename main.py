@@ -63,7 +63,7 @@ from hotkey_manager import HotkeyManager
 from audio_manager import AudioManager
 from asr_service import ASRService
 from text_insertion_service import TextInsertionService
-from waveform_visualizer import WaveformVisualizer
+from overlay_window import OverlayWindow
 import sounddevice as sd
 from PyObjCTools import AppHelper
 import time
@@ -93,7 +93,7 @@ class DictationApp(rumps.App):
         # Initialize services
         self.audio_manager = AudioManager()
         self.text_insertion_service = TextInsertionService()
-        self.waveform_visualizer = WaveformVisualizer()
+        self.overlay_window = OverlayWindow()
 
         # Determine model path based on whether we're running from a bundle or source
         if getattr(sys, "frozen", False):
@@ -136,8 +136,8 @@ class DictationApp(rumps.App):
 
     def _process_audio_chunk(self, chunk):
         self.asr_service.process_audio_chunk(chunk)
-        if self.waveform_visualizer:
-            self.waveform_visualizer.add_chunk(chunk)
+        if self.overlay_window:
+            self.overlay_window.add_chunk(chunk)
 
     def _create_timer_on_main(self, payload_with_context):
         # payload_with_context is expected to be timer_payload_for_main_thread from _handle_asr_service_result
@@ -299,7 +299,8 @@ class DictationApp(rumps.App):
                 if audio_is_recording_flag == True:
                     print(f"MAIN_APP ({log_id}): Cleanup – mic was still flagged recording; stopping.")
                     self.audio_manager.stop_recording(f"from_process_asr_result_finally_{log_id}")
-                    self.waveform_visualizer.stop()
+                    if self.overlay_window:
+                        AppHelper.callAfter(self.overlay_window.hide)
                 
                 print(f"MAIN_APP ({log_id}): is_transcribing POST: {self.is_transcribing}, dictation_active POST: {self.dictation_active}")
             else:
@@ -348,7 +349,8 @@ class DictationApp(rumps.App):
             
             self.dictation_active = True
             print(f"MAIN_APP ({log_id}): dictation_active SET to True.")
-            self.waveform_visualizer.start()
+            if self.overlay_window:
+                self.overlay_window.show()  # Call directly - we're already on main thread
             self.audio_manager.set_chunk_callback(self._process_audio_chunk)
             print(f"MAIN_APP ({log_id}): Calling audio_manager.start_recording().")
             if self.audio_manager.start_recording(f"from_activate_{log_id}"):
@@ -415,11 +417,12 @@ class DictationApp(rumps.App):
             return
 
         print(f"MAIN_APP ({log_id}): Deactivation - Stopping dictation logic...")
-        self.dictation_active = False 
+        self.dictation_active = False
         print(f"MAIN_APP ({log_id}): dictation_active SET to False.")
         print(f"MAIN_APP ({log_id}): Calling audio_manager.stop_recording().")
         self.audio_manager.stop_recording(f"from_deactivate_active_{log_id}")
-        self.waveform_visualizer.stop()
+        if self.overlay_window:
+            AppHelper.callAfter(self.overlay_window.hide)
         print(f"MAIN_APP ({log_id}): Audio recording stopped call returned.")
 
         if self.is_transcribing:
@@ -534,7 +537,8 @@ class DictationApp(rumps.App):
         if self.dictation_active:
             print("MAIN_APP: Quit - Dictation was active, stopping audio manager...")
             self.audio_manager.stop_recording()
-            self.waveform_visualizer.stop()
+            if self.overlay_window:
+                self.overlay_window.hide()
         
         print("MAIN_APP: Quit - Shutting down ASR service...")
         if self.asr_service: # Check if ASR service was initialized
