@@ -467,45 +467,50 @@ class DictationApp(rumps.App):
 
     def update_menu_state(self):
         toggle_item = self.menu["Toggle Dictation"]
-        
-        current_title = "Dictation App"
-        menu_item_title = f"Start Dictation (Press {self.hotkey_string})"
+
+        # Keep app title stable to avoid rumps menu bar disappearing bug
+        # Only change the menu item text to indicate state
+        menu_item_title = f"Start Dictation ({self.hotkey_string})"
 
         if self.asr_model_status == "initializing":
-            current_title = "Dictation App (ASR Init...)"
             menu_item_title = "ASR Initializing..."
         elif self.asr_model_status == "error":
-            current_title = "Dictation App (ASR ERR)"
             menu_item_title = "ASR Model Failed"
         elif self.is_transcribing:
-            current_title = "Dictation App (Processing...)"
             menu_item_title = "Processing..."
         elif self.dictation_active:
-            current_title = "Dictation App (Rec ●)"
-            menu_item_title = "Stop Dictation (Rec ●)"
-        
-        if self.title != current_title:
-            self.title = current_title
+            menu_item_title = "Stop Dictation (Recording...)"
+
         if toggle_item and toggle_item.title != menu_item_title:
             toggle_item.title = menu_item_title
 
     @rumps.clicked("Toggle Dictation")
     def toggle_dictation_manual(self, _):
         """Manual toggle for dictation - useful when hotkeys aren't working"""
-        print("MAIN_APP: Manual toggle dictation clicked")
-        
+        print(f"MAIN_APP: Manual toggle dictation clicked. dictation_active={self.dictation_active}, hotkey_active={self.hotkey_manager.hotkey_active}, is_transcribing={self.is_transcribing}")
+
         if self.asr_model_status == "initializing":
             rumps.notification("ASR Not Ready", "Model is still initializing.", "Please wait.")
             return
         elif self.asr_model_status == "error":
             rumps.alert("ASR Error", "ASR model failed to load. Cannot start dictation.")
             return
-        
-        if self.dictation_active:
-            # Currently active, so deactivate
+
+        # If transcription is in progress, ignore the toggle
+        if self.is_transcribing:
+            print("MAIN_APP: Manual toggle ignored - transcription in progress")
+            rumps.notification("Processing", "Please wait for transcription to complete.", "")
+            return
+
+        # Sync hotkey_active state with dictation_active for menu-based toggle
+        if self.dictation_active or self.hotkey_manager.hotkey_active:
+            # Currently active (by either mechanism), so deactivate
+            # Set hotkey_active to True so deactivate logic works correctly
+            self.hotkey_manager.hotkey_active = True
             self.request_deactivate_dictation()
         else:
             # Currently inactive, so activate
+            self.hotkey_manager.hotkey_active = True
             self.request_activate_dictation()
 
     @rumps.clicked("Settings")

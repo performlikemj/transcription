@@ -35,7 +35,11 @@ class AudioManager:
         print(f"AUDIO_MANAGER ({caller_context}): Recording loop thread started.")
         stream = None
         try:
-            # Log default input device
+            # IMPORTANT: Refresh device cache to detect newly connected devices
+            sd._terminate()
+            sd._initialize()
+
+            # Log default input device after refresh
             try:
                 default_device = sd.query_devices(kind='input')
                 print(f"AUDIO_MANAGER ({caller_context}): Default input device: {default_device['name']}")

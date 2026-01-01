@@ -1,5 +1,5 @@
 """
-Native macOS floating overlay window with waveform visualization.
+Native macOS floating overlay window with bar-style waveform visualization.
 Uses PyObjC/AppKit for thread-safe integration with rumps.
 """
 
@@ -18,13 +18,14 @@ import threading
 
 # Constants
 WINDOW_WIDTH = 400
-WINDOW_HEIGHT = 80
+WINDOW_HEIGHT = 70
 BUFFER_SAMPLES = 8000  # 0.5 seconds at 16kHz
 REFRESH_INTERVAL = 1.0 / 30  # 30 FPS
+NUM_BARS = 60  # Number of vertical bars
 
 
 class WaveformView(NSView):
-    """Custom NSView for drawing waveform using Core Graphics"""
+    """Custom NSView for drawing bar-style waveform"""
 
     def initWithFrame_(self, frame):
         self = objc.super(WaveformView, self).initWithFrame_(frame)
@@ -36,6 +37,7 @@ class WaveformView(NSView):
         self._lock = threading.Lock()
         self._timer = None
         self._is_active = False
+        self._bar_heights = np.zeros(NUM_BARS, dtype=np.float32)
         return self
 
     def isOpaque(self):
@@ -49,6 +51,7 @@ class WaveformView(NSView):
         self._is_active = True
         self._sample_buffer.clear()
         self._samples = np.zeros(BUFFER_SAMPLES, dtype=np.float32)
+        self._bar_heights = np.zeros(NUM_BARS, dtype=np.float32)
 
         # Create timer and add to run loop
         self._timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -93,79 +96,77 @@ class WaveformView(NSView):
                     samples = np.array(list(self._sample_buffer), dtype=np.float32)
                     self._samples = samples.copy()
 
+                    # Calculate bar heights from samples
+                    samples_per_bar = max(1, len(samples) // NUM_BARS)
+                    new_heights = np.zeros(NUM_BARS, dtype=np.float32)
+
+                    for i in range(NUM_BARS):
+                        start = i * samples_per_bar
+                        end = min(start + samples_per_bar, len(samples))
+                        if start < len(samples):
+                            # Use RMS for smoother visualization
+                            chunk = samples[start:end]
+                            new_heights[i] = np.sqrt(np.mean(chunk ** 2)) * 3.0  # Amplify
+
+                    # Smooth transition (lerp toward new values)
+                    self._bar_heights = self._bar_heights * 0.3 + new_heights * 0.7
+
             # Trigger redraw
             self.setNeedsDisplay_(True)
         except Exception as e:
             print(f"WAVEFORM_VIEW: Error in refresh: {e}")
 
     def drawRect_(self, rect):
-        # Draw background with transparency and rounded corners
+        # Draw dark background with rounded corners
         bg_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.1, 0.1, 0.1, 0.85
+            0.12, 0.12, 0.12, 0.92
         )
         bg_color.setFill()
 
-        # Create rounded rect path
         bg_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            rect, 12, 12
+            rect, 14, 14
         )
         bg_path.fill()
 
-        # Get samples thread-safely
+        # Draw waveform bars
         with self._lock:
-            samples = self._samples.copy()
+            heights = self._bar_heights.copy()
 
-        if len(samples) == 0:
-            return
+        padding = 20  # Horizontal padding
+        bar_area_width = rect.size.width - (padding * 2)
+        bar_width = bar_area_width / NUM_BARS
+        gap = 2  # Gap between bars
+        actual_bar_width = max(1, bar_width - gap)
+        center_y = rect.size.height / 2
+        max_bar_height = (rect.size.height / 2) * 0.8  # 80% of half height
 
-        # Downsample for drawing - one point per pixel
-        draw_points = int(rect.size.width)
-        if draw_points <= 0:
-            return
-
-        step = max(1, len(samples) // draw_points)
-        display_samples = samples[::step][:draw_points]
-
-        if len(display_samples) == 0:
-            return
-
-        # Normalize to view height
-        height = rect.size.height
-        mid_y = height / 2
-
-        # Create waveform path
-        path = NSBezierPath.bezierPath()
-        path.setLineWidth_(1.5)
-
-        for i, sample in enumerate(display_samples):
-            x = float(i)
-            # Clamp sample to [-1, 1] and scale to view height
-            clamped = max(-1.0, min(1.0, sample))
-            y = mid_y + (clamped * mid_y * 0.8)  # 80% of half-height
-
-            if i == 0:
-                path.moveToPoint_(NSPoint(x, y))
-            else:
-                path.lineToPoint_(NSPoint(x, y))
-
-        # Draw waveform in green
-        waveform_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.0, 0.8, 0.4, 1.0
+        # Bar color - light gray/white
+        bar_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.75, 0.75, 0.75, 0.9
         )
-        waveform_color.setStroke()
-        path.stroke()
+        bar_color.setFill()
 
-        # Draw center line (subtle)
-        center_path = NSBezierPath.bezierPath()
-        center_path.setLineWidth_(0.5)
-        center_path.moveToPoint_(NSPoint(0, mid_y))
-        center_path.lineToPoint_(NSPoint(rect.size.width, mid_y))
+        for i, height in enumerate(heights):
+            x = padding + i * bar_width + gap / 2
 
-        center_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.3, 0.3, 0.3, 0.5
-        )
-        center_color.setStroke()
-        center_path.stroke()
+            # Clamp height
+            bar_h = min(height, 1.0) * max_bar_height
+
+            # Minimum bar height for visual feedback (dotted line effect when quiet)
+            min_height = 1.5
+            bar_h = max(min_height, bar_h)
+
+            # Draw mirrored bar (up and down from center)
+            bar_rect = NSRect(
+                NSPoint(x, center_y - bar_h),
+                NSSize(actual_bar_width, bar_h * 2)
+            )
+
+            # Rounded bars
+            bar_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                bar_rect, actual_bar_width / 2, actual_bar_width / 2
+            )
+            bar_path.fill()
 
 
 class OverlayWindow:
@@ -186,7 +187,7 @@ class OverlayWindow:
         else:
             screen_frame = screen.frame()
             x = (screen_frame.size.width - WINDOW_WIDTH) / 2
-            y = 100  # 100px from bottom
+            y = 80  # 80px from bottom
 
         frame = NSRect(
             NSPoint(x, y),
