@@ -114,7 +114,7 @@ PY2APP_OPTS = dict(
         "pandas.tests","scipy.tests","sklearn.tests",
         "torch.testing","numba.tests",
     ],
-    resources   = [MODEL_FILE],  # Include the model file
+    resources   = [MODEL_FILE, "icon.png", "menubar_icon.png", "ui_config.py"],  # Include the model file and icons
     frameworks  = ["/opt/homebrew/lib/libsndfile.dylib"],
     site_packages = False,
     plist = {
@@ -123,6 +123,8 @@ PY2APP_OPTS = dict(
         "CFBundleShortVersionString": "0.1.0",
         "CFBundleVersion":            "0.1.0",
         "LSMinimumSystemVersion":     "13.0",
+        "LSUIElement":                False,  # Show in Dock since menu bar not working on macOS 26
+        "NSMainNibFile":              "",    # No nib - rumps creates UI programmatically
         "NSMicrophoneUsageDescription":
             "Speech to text for YardTalk",
     },
@@ -301,15 +303,15 @@ def _fix_torchaudio(plat_app):
             import shutil
             shutil.copy2(str(homebrew_liblzma), str(liblzma_path))
             print(f"✓ Replaced liblzma.5.dylib with fresh copy")
+            subprocess.run(["xattr", "-cr", str(liblzma_path)], check=False)
+            subprocess.run(["codesign", "--remove-signature", str(liblzma_path)], check=False)
+            check_call(["codesign", "--force", "-s", "-", "--timestamp=none", str(liblzma_path)])
         else:
             print(f"⚠️  Could not find Homebrew liblzma.5.dylib at {homebrew_liblzma}")
     
     # --- codesign every dylib under Contents/Frameworks ---
     if frameworks_dir.exists():
         for dylib in frameworks_dir.glob("*.dylib"):
-            if dylib.name.startswith("liblzma"):
-                print(f"skip re-signing {dylib.name}")
-                continue
             # Clear any Finder metadata or quarantine flags
             subprocess.run(["xattr", "-cr", str(dylib)], check=False)
 

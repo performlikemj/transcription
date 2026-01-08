@@ -59,6 +59,8 @@ def log_print(*args, **kwargs):
 print = log_print
 
 import rumps
+from app_paths import resolve_resource_path
+from ui_config import STATUS_TITLE, STATUS_USE_ICON
 from hotkey_manager import HotkeyManager
 from audio_manager import AudioManager
 from asr_service import ASRService
@@ -67,6 +69,7 @@ from overlay_window import OverlayWindow
 import sounddevice as sd
 from PyObjCTools import AppHelper
 import time
+import numpy as np
 
 # Used to distinguish ASR service callbacks
 ASR_CALLBACK_TYPE_MODEL_LOAD = "model_load_status"
@@ -74,13 +77,43 @@ ASR_CALLBACK_TYPE_TRANSCRIPTION = "transcription_result"
 
 class DictationApp(rumps.App):
     def __init__(self):
-        super(DictationApp, self).__init__("Dictation App", icon="icon.png")
+        icon_path = None
+        if STATUS_USE_ICON:
+            icon_path = resolve_resource_path("menubar_icon.png")
+            print(f"MAIN_APP: Looking for icon at: {icon_path}")
+            print(f"MAIN_APP: Icon exists: {icon_path.exists()}")
+            if not icon_path.exists():
+                icon_path = resolve_resource_path("icon.png")
+                print(f"MAIN_APP: Fallback icon path: {icon_path}, exists: {icon_path.exists()}")
+
+        print(f"MAIN_APP: STATUS_USE_ICON={STATUS_USE_ICON}, STATUS_TITLE='{STATUS_TITLE}'")
+        print(f"MAIN_APP: Final icon_path={icon_path}")
+
+        super(DictationApp, self).__init__(
+            "Dictation App",
+            title=STATUS_TITLE if STATUS_TITLE else None,
+            icon=str(icon_path) if icon_path and icon_path.exists() else None,
+            template=False,  # Changed from True - template icons need special format
+        )
+        # If no title and no icon, set a fallback title
+        if not STATUS_TITLE and not (icon_path and icon_path.exists()):
+            self.title = "YT"
+            print("MAIN_APP: No icon or title, using fallback 'YT'")
+        else:
+            self.title = STATUS_TITLE
+        print(f"MAIN_APP: App initialized with title='{self.title}', icon='{self.icon}'")
         self.menu = ["Toggle Dictation", "Settings", None, "Quit"]
         
         self.dictation_active = False
-        self.is_transcribing = False 
+        self.is_transcribing = False
         # Use a hotkey combination that doesn't conflict with common system shortcuts
         self.hotkey_string = "<cmd>+<shift>+d"  # Command+Shift+D - less likely to conflict
+
+        # Silence detection settings for auto-send
+        self.silence_threshold = 500  # RMS level below which audio is considered silence (int16 scale)
+        self.silence_duration = 2.0   # Seconds of silence before auto-sending
+        self._last_sound_time = None  # Timestamp of last non-silent audio
+        self._auto_stop_pending = False  # Prevent multiple auto-stops
         
         self.asr_model_status = "initializing" # "initializing", "loaded", "error"
         # Flag to ensure MODEL_LOADED_SUCCESSFULLY is handled only once
@@ -99,10 +132,11 @@ class DictationApp(rumps.App):
         if getattr(sys, "frozen", False):
             # Running inside YardTalk.app
             bundle_root = pathlib.Path(sys.executable).resolve().parents[1]  # .../Contents
-            model_path = bundle_root / "Resources" / "parakeet-tdt-0.6b-v2" / "parakeet-tdt-0.6b-v2.nemo"
+            # Model is placed directly in Resources (not in a subdirectory)
+            model_path = bundle_root / "Resources" / "parakeet-tdt-0.6b-v2.nemo"
             model_path = str(model_path)
         else:
-            # Running from source
+            # Running from source (model is in a subdirectory)
             model_path = "parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo"
         
         print(f"MAIN_APP: Using model path: {model_path}")
@@ -138,6 +172,33 @@ class DictationApp(rumps.App):
         self.asr_service.process_audio_chunk(chunk)
         if self.overlay_window:
             self.overlay_window.add_chunk(chunk)
+
+        # Silence detection for auto-send
+        if self.dictation_active and not self._auto_stop_pending:
+            # Calculate RMS (root mean square) of the audio chunk
+            audio_data = chunk.flatten().astype(np.float32)
+            rms = np.sqrt(np.mean(audio_data ** 2))
+
+            current_time = time.time()
+
+            if rms > self.silence_threshold:
+                # Sound detected - reset the silence timer
+                self._last_sound_time = current_time
+            elif self._last_sound_time is not None:
+                # Check if we've been silent long enough
+                silence_elapsed = current_time - self._last_sound_time
+                if silence_elapsed >= self.silence_duration:
+                    print(f"MAIN_APP: Auto-stop triggered after {silence_elapsed:.1f}s of silence (RMS: {rms:.0f})")
+                    self._auto_stop_pending = True
+                    AppHelper.callAfter(self._auto_deactivate_dictation)
+
+    def _auto_deactivate_dictation(self):
+        """Automatically deactivate dictation after silence detection"""
+        if self.dictation_active and not self.is_transcribing:
+            print("MAIN_APP: Auto-deactivating dictation due to silence")
+            self.hotkey_manager.hotkey_active = True  # Simulate hotkey state for proper deactivation
+            self.request_deactivate_dictation()
+        self._auto_stop_pending = False
 
     def _create_timer_on_main(self, payload_with_context):
         # payload_with_context is expected to be timer_payload_for_main_thread from _handle_asr_service_result
@@ -348,6 +409,8 @@ class DictationApp(rumps.App):
             print(f"MAIN_APP ({log_id}): Activation - After clearing ASR buffer.")
             
             self.dictation_active = True
+            self._last_sound_time = time.time()  # Initialize silence timer
+            self._auto_stop_pending = False
             print(f"MAIN_APP ({log_id}): dictation_active SET to True.")
             if self.overlay_window:
                 self.overlay_window.show()  # Call directly - we're already on main thread
