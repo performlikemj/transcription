@@ -66,10 +66,94 @@ from audio_manager import AudioManager
 from asr_service import ASRService
 from text_insertion_service import TextInsertionService
 from overlay_window import OverlayWindow
+from settings_manager import SettingsManager
+from preferences_window import PreferencesWindow
 import sounddevice as sd
 from PyObjCTools import AppHelper
 import time
 import numpy as np
+
+# For Dock menu support
+import objc
+from AppKit import NSApplication, NSMenu, NSMenuItem
+from Foundation import NSObject
+
+# Global reference to the app instance for menu callbacks
+_app_instance = None
+
+
+class AppMenuHandler(NSObject):
+    """Handler for application menu items."""
+
+    @objc.python_method
+    def _get_app(self):
+        global _app_instance
+        return _app_instance
+
+    def openSettings_(self, sender):
+        """Handle Settings menu click."""
+        app = self._get_app()
+        if app:
+            AppHelper.callAfter(app._open_settings_window)
+
+    def toggleDictation_(self, sender):
+        """Handle Toggle Dictation menu click."""
+        app = self._get_app()
+        if app:
+            AppHelper.callAfter(app._toggle_dictation_from_dock)
+
+
+def setup_app_menu(handler):
+    """Add Settings item to the application menu (YardTalk menu in menu bar)."""
+    app = NSApplication.sharedApplication()
+    main_menu = app.mainMenu()
+
+    if main_menu is None:
+        print("MAIN_APP: No main menu found, cannot add Settings")
+        return False
+
+    # The first submenu is the application menu (YardTalk)
+    if main_menu.numberOfItems() > 0:
+        app_menu_item = main_menu.itemAtIndex_(0)
+        app_menu = app_menu_item.submenu()
+
+        if app_menu:
+            # Get current item count to determine safe insertion point
+            item_count = app_menu.numberOfItems()
+            print(f"MAIN_APP: App menu has {item_count} items")
+
+            # Insert after the first item (usually "About"), or at index 1 if possible
+            insert_index = min(1, item_count)
+
+            # Add separator before our items
+            app_menu.insertItem_atIndex_(NSMenuItem.separatorItem(), insert_index)
+            insert_index += 1
+
+            # Add Settings item with Cmd+, shortcut
+            settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Settings...", "openSettings:", ","
+            )
+            settings_item.setTarget_(handler)
+            app_menu.insertItem_atIndex_(settings_item, insert_index)
+            insert_index += 1
+
+            # Add Toggle Dictation item
+            toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "Toggle Dictation", "toggleDictation:", ""
+            )
+            toggle_item.setTarget_(handler)
+            app_menu.insertItem_atIndex_(toggle_item, insert_index)
+            insert_index += 1
+
+            # Add another separator
+            app_menu.insertItem_atIndex_(NSMenuItem.separatorItem(), insert_index)
+
+            print("MAIN_APP: Added Settings and Toggle Dictation to app menu")
+            return True
+
+    print("MAIN_APP: Could not find app menu to modify")
+    return False
+
 
 # Used to distinguish ASR service callbacks
 ASR_CALLBACK_TYPE_MODEL_LOAD = "model_load_status"
@@ -106,11 +190,14 @@ class DictationApp(rumps.App):
         
         self.dictation_active = False
         self.is_transcribing = False
-        # Use a hotkey combination that doesn't conflict with common system shortcuts
-        self.hotkey_string = "<cmd>+<shift>+d"  # Command+Shift+D - less likely to conflict
+
+        # Initialize settings manager and load saved hotkey
+        self.settings_manager = SettingsManager()
+        self.hotkey_string = self.settings_manager.get_hotkey()
+        self.preferences_window = None  # Lazy initialization
 
         # Silence detection settings for auto-send
-        self.silence_threshold = 500  # RMS level below which audio is considered silence (int16 scale)
+        self.silence_threshold = 150  # RMS level below which audio is considered silence (lowered from 500)
         self.silence_duration = 2.0   # Seconds of silence before auto-sending
         self._last_sound_time = None  # Timestamp of last non-silent audio
         self._auto_stop_pending = False  # Prevent multiple auto-stops
@@ -152,7 +239,17 @@ class DictationApp(rumps.App):
         # Start hotkey manager after a short delay to ensure rumps is fully initialized
         print("MAIN_APP: Scheduling hotkey manager startup...")
         rumps.Timer(self._start_hotkey_manager, 1.0).start()
-        
+
+        # Set up global settings shortcut (Cmd+,)
+        global _app_instance
+        _app_instance = self
+        self._settings_shortcut_active = False
+        self._setup_settings_shortcut()
+
+        # Set up application menu (YardTalk menu) with Settings item
+        self._menu_handler = AppMenuHandler.alloc().init()
+        rumps.Timer(self._setup_app_menu, 0.5).start()
+
         # Initial menu state is set above, will be updated by ASR callback
 
     def _start_hotkey_manager(self, timer):
@@ -168,10 +265,72 @@ class DictationApp(rumps.App):
         finally:
             timer.stop()  # Make this a one-shot timer
 
+    def _setup_app_menu(self, timer):
+        """Add Settings to the application menu after rumps is initialized"""
+        try:
+            if setup_app_menu(self._menu_handler):
+                print("MAIN_APP: Application menu configured with Settings")
+            else:
+                print("MAIN_APP: Could not configure application menu")
+        except Exception as e:
+            print(f"MAIN_APP: Error setting up app menu: {e}")
+        finally:
+            timer.stop()  # Make this a one-shot timer
+
+    def _setup_settings_shortcut(self):
+        """Set up Cmd+, global shortcut to open Settings."""
+        from pynput import keyboard
+
+        def on_key_press(key):
+            # Track Cmd key state
+            if key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
+                self._cmd_pressed = True
+                return
+
+            # Check for comma key while Cmd is held
+            if self._cmd_pressed:
+                # Check by character
+                is_comma = False
+                if hasattr(key, 'char') and key.char == ',':
+                    is_comma = True
+                # Also check by virtual key code (43 is comma on macOS)
+                elif hasattr(key, 'vk') and key.vk == 43:
+                    is_comma = True
+
+                if is_comma:
+                    print("MAIN_APP: Settings shortcut (Cmd+,) detected!")
+                    AppHelper.callAfter(self._open_settings_window)
+
+        def on_key_release(key):
+            if key == keyboard.Key.cmd or key == keyboard.Key.cmd_l or key == keyboard.Key.cmd_r:
+                self._cmd_pressed = False
+
+        self._cmd_pressed = False
+        self._settings_listener = keyboard.Listener(
+            on_press=on_key_press,
+            on_release=on_key_release
+        )
+        self._settings_listener.start()
+        print("MAIN_APP: Settings shortcut (Cmd+,) listener started")
+
     def _process_audio_chunk(self, chunk):
         self.asr_service.process_audio_chunk(chunk)
+
+        # Diagnostic logging for overlay state
+        if not hasattr(self, '_chunk_log_count'):
+            self._chunk_log_count = 0
+        self._chunk_log_count += 1
+
         if self.overlay_window:
+            # Log overlay state periodically
+            if self._chunk_log_count % 50 == 1:
+                overlay_visible = getattr(self.overlay_window, '_is_visible', 'N/A')
+                waveform_view = getattr(self.overlay_window, '_waveform_view', None)
+                waveform_active = getattr(waveform_view, '_is_active', 'N/A') if waveform_view else 'N/A'
+                print(f"MAIN_APP: Chunk #{self._chunk_log_count} - overlay_visible={overlay_visible}, waveform_active={waveform_active}")
             self.overlay_window.add_chunk(chunk)
+        else:
+            print("MAIN_APP: WARNING - overlay_window is None, can't add chunk")
 
         # Silence detection for auto-send
         if self.dictation_active and not self._auto_stop_pending:
@@ -180,6 +339,14 @@ class DictationApp(rumps.App):
             rms = np.sqrt(np.mean(audio_data ** 2))
 
             current_time = time.time()
+
+            # Log RMS periodically for debugging
+            if not hasattr(self, '_rms_log_count'):
+                self._rms_log_count = 0
+            self._rms_log_count += 1
+            if self._rms_log_count % 20 == 1:  # Log every 20 chunks
+                silence_elapsed = current_time - self._last_sound_time if self._last_sound_time else 0
+                print(f"MAIN_APP: Audio RMS={rms:.0f} (threshold={self.silence_threshold}), silence_elapsed={silence_elapsed:.1f}s")
 
             if rms > self.silence_threshold:
                 # Sound detected - reset the silence timer
@@ -413,7 +580,10 @@ class DictationApp(rumps.App):
             self._auto_stop_pending = False
             print(f"MAIN_APP ({log_id}): dictation_active SET to True.")
             if self.overlay_window:
+                print(f"MAIN_APP ({log_id}): Showing overlay window...")
                 self.overlay_window.show()  # Call directly - we're already on main thread
+            else:
+                print(f"MAIN_APP ({log_id}): WARNING - overlay_window is None!")
             self.audio_manager.set_chunk_callback(self._process_audio_chunk)
             print(f"MAIN_APP ({log_id}): Calling audio_manager.start_recording().")
             if self.audio_manager.start_recording(f"from_activate_{log_id}"):
@@ -578,26 +748,83 @@ class DictationApp(rumps.App):
 
     @rumps.clicked("Settings")
     def settings(self, _):
-        mic_names = []
-        try:
-            devices = sd.query_devices()
-            input_devices = [dev for dev in devices if dev['max_input_channels'] > 0]
-            for i, device in enumerate(input_devices):
-                mic_names.append(f"{i}: {device['name']}")
-            mic_info = "\nAvailable Microphones:\n" + "\n".join(mic_names) if mic_names else "\nNo microphones found."
-        except Exception as e:
-            mic_info = f"\nCould not query microphones: {e}"
+        """Open the preferences window."""
+        if self.preferences_window is None:
+            self.preferences_window = PreferencesWindow(
+                current_hotkey=self.hotkey_string,
+                on_hotkey_changed=self._on_hotkey_changed,
+                on_reset=self._on_hotkey_reset
+            )
+        self.preferences_window.set_current_hotkey(self.hotkey_string)
+        self.preferences_window.show()
 
-        asr_status_detail = "Unknown"
-        if self.asr_model_status == "loaded":
-            asr_status_detail = f"Loaded on {self.asr_service.device if self.asr_service else 'N/A'}"
-        elif self.asr_model_status == "initializing":
-            asr_status_detail = "Initializing..."
-        elif self.asr_model_status == "error":
-            asr_status_detail = "Error during load"
-        
-        settings_message = f"Hotkey: {self.hotkey_string}\nASR Model Status: {asr_status_detail}{mic_info}"
-        rumps.alert("Settings", settings_message)
+    def _open_settings_window(self):
+        """Open settings window - called from Dock menu."""
+        print("MAIN_APP: Opening settings from Dock menu")
+        self.settings(None)
+
+    def _toggle_dictation_from_dock(self):
+        """Toggle dictation - called from Dock menu."""
+        print("MAIN_APP: Toggle dictation from Dock menu")
+        self.toggle_dictation_manual(None)
+
+    def _on_hotkey_changed(self, new_hotkey: str):
+        """Callback when user saves a new hotkey in preferences."""
+        if new_hotkey == self.hotkey_string:
+            return  # No change
+
+        # Validate by attempting to parse with pynput
+        try:
+            from pynput import keyboard
+            keyboard.HotKey.parse(new_hotkey)
+        except Exception as e:
+            rumps.alert("Invalid Hotkey", f"Could not parse hotkey: {e}")
+            return
+
+        # Store for deferred update
+        self._pending_hotkey = new_hotkey
+        # Stop settings listener before update to avoid conflicts
+        if hasattr(self, '_settings_listener') and self._settings_listener:
+            print("MAIN_APP: Stopping settings listener before hotkey update")
+            self._settings_listener.stop()
+            self._settings_listener = None
+        # Defer the actual update to avoid threading issues with rumps
+        print(f"MAIN_APP: Scheduling hotkey update to '{new_hotkey}'")
+        rumps.Timer(self._do_hotkey_update, 0.1).start()
+
+    def _do_hotkey_update(self, timer):
+        """Perform the actual hotkey update (called from timer to avoid threading issues)."""
+        timer.stop()
+        new_hotkey = getattr(self, '_pending_hotkey', None)
+        if not new_hotkey:
+            return
+
+        print(f"MAIN_APP: Updating hotkey to '{new_hotkey}'")
+        try:
+            if self.hotkey_manager.update_hotkey(new_hotkey):
+                self.hotkey_string = new_hotkey
+                self.settings_manager.set_hotkey(new_hotkey)
+                self.update_menu_state()
+                rumps.notification(
+                    "Hotkey Updated",
+                    "New hotkey active",
+                    f"Press {new_hotkey} to start dictation"
+                )
+                print("MAIN_APP: Hotkey update complete!")
+            else:
+                rumps.alert("Hotkey Error", "Failed to update hotkey. Please try again.")
+        except Exception as e:
+            print(f"MAIN_APP: Error during hotkey update: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self._pending_hotkey = None
+
+    def _on_hotkey_reset(self):
+        """Callback when user clicks Reset to Default in preferences."""
+        default_hotkey = SettingsManager.DEFAULT_HOTKEY
+        if default_hotkey != self.hotkey_string:
+            self._on_hotkey_changed(default_hotkey)
 
     @rumps.clicked("Quit")
     def quit_app(self, _):

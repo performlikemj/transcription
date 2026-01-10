@@ -45,7 +45,9 @@ class WaveformView(NSView):
 
     def startUpdating(self):
         """Start the refresh timer"""
+        print(f"WAVEFORM_VIEW: startUpdating called, _is_active={self._is_active}")
         if self._is_active:
+            print("WAVEFORM_VIEW: Already active, returning")
             return
 
         self._is_active = True
@@ -53,7 +55,8 @@ class WaveformView(NSView):
         self._samples = np.zeros(BUFFER_SAMPLES, dtype=np.float32)
         self._bar_heights = np.zeros(NUM_BARS, dtype=np.float32)
 
-        # Create timer and add to run loop
+        # Create timer and add to MAIN run loop (not currentRunLoop which may differ)
+        print("WAVEFORM_VIEW: Creating timer...")
         self._timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
             REFRESH_INTERVAL,
             self,
@@ -61,7 +64,9 @@ class WaveformView(NSView):
             None,
             True
         )
-        NSRunLoop.currentRunLoop().addTimer_forMode_(self._timer, NSDefaultRunLoopMode)
+        # Use mainRunLoop to ensure timer fires on the main thread
+        NSRunLoop.mainRunLoop().addTimer_forMode_(self._timer, NSDefaultRunLoopMode)
+        print("WAVEFORM_VIEW: Timer added to MAIN run loop")
 
     def stopUpdating(self):
         """Stop the refresh timer"""
@@ -76,16 +81,28 @@ class WaveformView(NSView):
 
         self._sample_buffer.clear()
 
+    _chunk_count = 0
+
     def addChunk_(self, chunk_float):
         """Add audio samples to buffer (thread-safe)"""
         if not self._is_active:
             return
 
+        self._chunk_count = getattr(self, '_chunk_count', 0) + 1
+        if self._chunk_count % 50 == 1:  # Log every 50 chunks
+            print(f"WAVEFORM_VIEW: addChunk_ #{self._chunk_count}, len={len(chunk_float)}")
+
         with self._lock:
             self._sample_buffer.extend(chunk_float)
 
+    _refresh_count = 0
+
     def refresh_(self, timer):
         """Timer callback to update display"""
+        self._refresh_count = getattr(self, '_refresh_count', 0) + 1
+        if self._refresh_count % 30 == 1:  # Log every ~1 second at 30fps
+            print(f"WAVEFORM_VIEW: refresh_ #{self._refresh_count}, active={self._is_active}")
+
         if not self._is_active:
             return
 
@@ -106,7 +123,7 @@ class WaveformView(NSView):
                         if start < len(samples):
                             # Use RMS for smoother visualization
                             chunk = samples[start:end]
-                            new_heights[i] = np.sqrt(np.mean(chunk ** 2)) * 3.0  # Amplify
+                            new_heights[i] = np.sqrt(np.mean(chunk ** 2)) * 15.0  # Amplify (increased from 3.0)
 
                     # Smooth transition (lerp toward new values)
                     self._bar_heights = self._bar_heights * 0.3 + new_heights * 0.7
@@ -153,7 +170,7 @@ class WaveformView(NSView):
             bar_h = min(height, 1.0) * max_bar_height
 
             # Minimum bar height for visual feedback (dotted line effect when quiet)
-            min_height = 1.5
+            min_height = 0.5  # Reduced from 1.5 to allow audio levels to show through
             bar_h = max(min_height, bar_h)
 
             # Draw mirrored bar (up and down from center)
@@ -220,30 +237,50 @@ class OverlayWindow:
 
     def show(self):
         """Show window and start refresh timer (call on main thread)"""
+        print(f"OVERLAY: show() called, was_visible={self._is_visible}")
         if self._is_visible:
+            print("OVERLAY: Already visible, returning early")
             return
 
         self._is_visible = True
         self._window.orderFront_(None)
+        print(f"OVERLAY: Window ordered front, _is_visible={self._is_visible}")
 
         if self._waveform_view:
+            print("OVERLAY: Starting waveform view updating...")
             self._waveform_view.startUpdating()
+            print(f"OVERLAY: Waveform view startUpdating done, _is_active={self._waveform_view._is_active}")
+        else:
+            print("OVERLAY: WARNING - No waveform view to start!")
 
     def hide(self):
         """Hide window and stop timer (call on main thread)"""
+        print(f"OVERLAY: hide() called, was_visible={self._is_visible}")
         if not self._is_visible:
+            print("OVERLAY: Already hidden, returning early")
             return
 
         self._is_visible = False
+        print(f"OVERLAY: Set _is_visible=False")
 
         if self._waveform_view:
+            print("OVERLAY: Stopping waveform view updating...")
             self._waveform_view.stopUpdating()
 
         self._window.orderOut_(None)
+        print("OVERLAY: Window ordered out")
+
+    _add_chunk_log_count = 0
 
     def add_chunk(self, chunk_int16):
         """Add audio chunk (thread-safe, can be called from any thread)"""
+        self._add_chunk_log_count = getattr(self, '_add_chunk_log_count', 0) + 1
+        if self._add_chunk_log_count % 100 == 1:
+            print(f"OVERLAY: add_chunk #{self._add_chunk_log_count}, visible={self._is_visible}, view={self._waveform_view is not None}")
+
         if not self._is_visible or not self._waveform_view:
+            if self._add_chunk_log_count % 100 == 1:
+                print(f"OVERLAY: Skipping chunk - visible={self._is_visible}")
             return
 
         try:

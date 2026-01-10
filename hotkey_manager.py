@@ -117,25 +117,34 @@ class HotkeyManager:
             traceback.print_exc()
 
     def start_listening(self):
+        import sys as _sys
         try:
             print(f"Starting hotkey listener for {self.hotkey_str}...")
-            
+            _sys.stdout.flush()
+
             # Validate hotkey format for macOS
             if sys.platform == "darwin" and "<fn>" in self.hotkey_str:
                 print("HOTKEY_MANAGER: WARNING - Function key (fn) combinations may not work reliably on macOS")
                 print("HOTKEY_MANAGER: Consider using <cmd>, <alt>, <ctrl>, or <shift> instead")
-            
+
             # Since GlobalHotKeys doesn't work well with F9, use direct key listener
             print("HOTKEY_DEBUG: Starting direct F9 key listener...")
+            _sys.stdout.flush()
             try:
+                print("HOTKEY_DEBUG: Creating Listener object...")
+                _sys.stdout.flush()
                 self.listener = keyboard.Listener(
                     on_press=self._on_key_press_with_hotkey_detection,
                     on_release=self._on_key_release_with_hotkey_detection
                 )
+                print("HOTKEY_DEBUG: Listener created, calling start()...")
+                _sys.stdout.flush()
                 self.listener.start()
                 print("HOTKEY_DEBUG: Direct key listener started successfully")
+                _sys.stdout.flush()
             except Exception as debug_error:
                 print(f"HOTKEY_DEBUG: Failed to start direct listener: {debug_error}")
+                _sys.stdout.flush()
                 
         except Exception as e:
             print(f"HOTKEY_MANAGER: Error starting listener: {e}")
@@ -150,7 +159,8 @@ class HotkeyManager:
             if self.listener:
                 print("Stopping hotkey listener...")
                 self.listener.stop()
-                self.listener.join() # Wait for the listener thread to finish
+                # Don't join - let it stop asynchronously to avoid blocking issues
+                # self.listener.join()
                 self.listener = None
                 print("Hotkey listener stopped.")
             else:
@@ -158,6 +168,31 @@ class HotkeyManager:
         except Exception as e:
             print(f"HOTKEY_MANAGER: Error stopping listener: {e}")
             traceback.print_exc()
+
+    def update_hotkey(self, new_hotkey_str: str) -> bool:
+        """
+        Update the hotkey at runtime.
+
+        Updates the hotkey binding without restarting the listener.
+        The listener passes events to self._hotkey, so we just need to
+        update that object.
+        """
+        try:
+            print(f"HOTKEY_MANAGER: Updating hotkey from '{self.hotkey_str}' to '{new_hotkey_str}'")
+
+            # Update the hotkey string
+            self.hotkey_str = new_hotkey_str
+            self.hotkey_active = False  # Reset toggle state
+
+            # Reconfigure the HotKey object (listener will use the new binding)
+            self._configure_hotkey()
+
+            print(f"HOTKEY_MANAGER: Hotkey updated successfully to '{new_hotkey_str}'")
+            return True
+        except Exception as e:
+            print(f"HOTKEY_MANAGER: Failed to update hotkey: {e}")
+            traceback.print_exc()
+            return False
 
     def _on_key_press_with_hotkey_detection(self, key):
         """Combined debug and hotkey detection"""
