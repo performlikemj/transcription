@@ -60,7 +60,7 @@ print = log_print
 
 import rumps
 from app_paths import resolve_resource_path
-from ui_config import STATUS_TITLE, STATUS_USE_ICON
+# ui_config imports removed - using simple icon="icon.png" instead
 from hotkey_manager import HotkeyManager
 from audio_manager import AudioManager
 from asr_service import ASRService
@@ -68,6 +68,9 @@ from text_insertion_service import TextInsertionService
 from overlay_window import OverlayWindow
 from settings_manager import SettingsManager
 from preferences_window import PreferencesWindow
+from transcription_history import TranscriptionHistory
+from correction_window import CorrectionWindow
+from live_transcription_service import LiveTranscriptionService
 import sounddevice as sd
 from PyObjCTools import AppHelper
 import time
@@ -75,7 +78,7 @@ import numpy as np
 
 # For Dock menu support
 import objc
-from AppKit import NSApplication, NSMenu, NSMenuItem
+from AppKit import NSApplication, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString
 from Foundation import NSObject
 
 # Global reference to the app instance for menu callbacks
@@ -83,7 +86,7 @@ _app_instance = None
 
 
 class AppMenuHandler(NSObject):
-    """Handler for application menu items."""
+    """Handler for application menu items and Dock menu."""
 
     @objc.python_method
     def _get_app(self):
@@ -102,57 +105,185 @@ class AppMenuHandler(NSObject):
         if app:
             AppHelper.callAfter(app._toggle_dictation_from_dock)
 
+    def copyHistoryEntry_(self, sender):
+        """Copy a history entry to clipboard."""
+        # The entry is stored in the menu item's represented object
+        entry = sender.representedObject()
+        if entry:
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(entry.display_text, NSPasteboardTypeString)
+            print(f"MAIN_APP: Copied history entry to clipboard")
+
+    def clearHistory_(self, sender):
+        """Clear all history entries."""
+        app = self._get_app()
+        if app:
+            AppHelper.callAfter(app._clear_history, None)
+
+    def applicationDockMenu_(self, sender):
+        """Provide the Dock right-click menu."""
+        menu = NSMenu.alloc().init()
+
+        # Toggle Dictation item
+        app = self._get_app()
+        toggle_title = "Start Dictation"
+        if app and app.dictation_active:
+            toggle_title = "Stop Dictation"
+        elif app and app.is_transcribing:
+            toggle_title = "Processing..."
+
+        toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            toggle_title, "toggleDictation:", ""
+        )
+        toggle_item.setTarget_(self)
+        menu.addItem_(toggle_item)
+
+        # Separator
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Settings item
+        settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Settings...", "openSettings:", ""
+        )
+        settings_item.setTarget_(self)
+        menu.addItem_(settings_item)
+
+        return menu
+
 
 def setup_app_menu(handler):
-    """Add Settings item to the application menu (YardTalk menu in menu bar)."""
+    """Build a complete menu bar like Terminal has."""
     app = NSApplication.sharedApplication()
-    main_menu = app.mainMenu()
 
-    if main_menu is None:
-        print("MAIN_APP: No main menu found, cannot add Settings")
-        return False
+    # Create a brand new menu bar
+    main_menu = NSMenu.alloc().init()
 
-    # The first submenu is the application menu (YardTalk)
-    if main_menu.numberOfItems() > 0:
-        app_menu_item = main_menu.itemAtIndex_(0)
-        app_menu = app_menu_item.submenu()
+    # === 1. Application Menu (YardTalk) ===
+    app_menu = NSMenu.alloc().initWithTitle_("YardTalk")
+    app_menu_item = NSMenuItem.alloc().init()
+    app_menu_item.setSubmenu_(app_menu)
 
-        if app_menu:
-            # Get current item count to determine safe insertion point
-            item_count = app_menu.numberOfItems()
-            print(f"MAIN_APP: App menu has {item_count} items")
+    # About YardTalk
+    about_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "About YardTalk", "orderFrontStandardAboutPanel:", ""
+    )
+    app_menu.addItem_(about_item)
 
-            # Insert after the first item (usually "About"), or at index 1 if possible
-            insert_index = min(1, item_count)
+    app_menu.addItem_(NSMenuItem.separatorItem())
 
-            # Add separator before our items
-            app_menu.insertItem_atIndex_(NSMenuItem.separatorItem(), insert_index)
-            insert_index += 1
+    # Settings with Cmd+,
+    settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Settings...", "openSettings:", ","
+    )
+    settings_item.setTarget_(handler)
+    app_menu.addItem_(settings_item)
 
-            # Add Settings item with Cmd+, shortcut
-            settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Settings...", "openSettings:", ","
-            )
-            settings_item.setTarget_(handler)
-            app_menu.insertItem_atIndex_(settings_item, insert_index)
-            insert_index += 1
+    app_menu.addItem_(NSMenuItem.separatorItem())
 
-            # Add Toggle Dictation item
-            toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Toggle Dictation", "toggleDictation:", ""
-            )
-            toggle_item.setTarget_(handler)
-            app_menu.insertItem_atIndex_(toggle_item, insert_index)
-            insert_index += 1
+    # Hide YardTalk (Cmd+H)
+    hide_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Hide YardTalk", "hide:", "h"
+    )
+    app_menu.addItem_(hide_item)
 
-            # Add another separator
-            app_menu.insertItem_atIndex_(NSMenuItem.separatorItem(), insert_index)
+    # Hide Others (Cmd+Opt+H)
+    hide_others = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Hide Others", "hideOtherApplications:", "h"
+    )
+    hide_others.setKeyEquivalentModifierMask_(1 << 19 | 1 << 20)  # Cmd+Opt
+    app_menu.addItem_(hide_others)
 
-            print("MAIN_APP: Added Settings and Toggle Dictation to app menu")
-            return True
+    # Show All
+    show_all = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Show All", "unhideAllApplications:", ""
+    )
+    app_menu.addItem_(show_all)
 
-    print("MAIN_APP: Could not find app menu to modify")
-    return False
+    app_menu.addItem_(NSMenuItem.separatorItem())
+
+    # Quit YardTalk (Cmd+Q)
+    quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Quit YardTalk", "terminate:", "q"
+    )
+    app_menu.addItem_(quit_item)
+
+    main_menu.addItem_(app_menu_item)
+
+    # === 2. Dictation Menu ===
+    dictation_menu = NSMenu.alloc().initWithTitle_("Dictation")
+    dictation_menu_item = NSMenuItem.alloc().init()
+    dictation_menu_item.setSubmenu_(dictation_menu)
+    dictation_menu_item.setTitle_("Dictation")
+
+    # Toggle Dictation
+    toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Start Dictation", "toggleDictation:", "d"
+    )
+    toggle_item.setTarget_(handler)
+    dictation_menu.addItem_(toggle_item)
+
+    dictation_menu.addItem_(NSMenuItem.separatorItem())
+
+    # Recent Transcriptions (placeholder - will be dynamic)
+    recent_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Recent Transcriptions", "", ""
+    )
+    recent_submenu = NSMenu.alloc().initWithTitle_("Recent Transcriptions")
+    placeholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "No transcriptions yet", "", ""
+    )
+    placeholder.setEnabled_(False)
+    recent_submenu.addItem_(placeholder)
+    recent_item.setSubmenu_(recent_submenu)
+    dictation_menu.addItem_(recent_item)
+
+    main_menu.addItem_(dictation_menu_item)
+
+    # === 3. Window Menu ===
+    window_menu = NSMenu.alloc().initWithTitle_("Window")
+    window_menu_item = NSMenuItem.alloc().init()
+    window_menu_item.setSubmenu_(window_menu)
+    window_menu_item.setTitle_("Window")
+
+    # Minimize (Cmd+M)
+    minimize_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Minimize", "performMiniaturize:", "m"
+    )
+    window_menu.addItem_(minimize_item)
+
+    # Zoom
+    zoom_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "Zoom", "performZoom:", ""
+    )
+    window_menu.addItem_(zoom_item)
+
+    main_menu.addItem_(window_menu_item)
+
+    # === 4. Help Menu ===
+    help_menu = NSMenu.alloc().initWithTitle_("Help")
+    help_menu_item = NSMenuItem.alloc().init()
+    help_menu_item.setSubmenu_(help_menu)
+    help_menu_item.setTitle_("Help")
+
+    # YardTalk Help
+    help_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        "YardTalk Help", "showHelp:", "?"
+    )
+    help_menu.addItem_(help_item)
+
+    main_menu.addItem_(help_menu_item)
+
+    # Set the menu bar
+    app.setMainMenu_(main_menu)
+
+    # Store references for later updates
+    handler.dictation_menu = dictation_menu
+    handler.toggle_menu_item = toggle_item
+    handler.recent_submenu = recent_submenu
+
+    print("MAIN_APP: Full menu bar created (YardTalk, Dictation, Window, Help)")
+    return True
 
 
 # Used to distinguish ASR service callbacks
@@ -161,33 +292,22 @@ ASR_CALLBACK_TYPE_TRANSCRIPTION = "transcription_result"
 
 class DictationApp(rumps.App):
     def __init__(self):
-        icon_path = None
-        if STATUS_USE_ICON:
-            icon_path = resolve_resource_path("menubar_icon.png")
-            print(f"MAIN_APP: Looking for icon at: {icon_path}")
-            print(f"MAIN_APP: Icon exists: {icon_path.exists()}")
-            if not icon_path.exists():
-                icon_path = resolve_resource_path("icon.png")
-                print(f"MAIN_APP: Fallback icon path: {icon_path}, exists: {icon_path.exists()}")
+        # Simple initialization that works (from commit 1fbd7e3)
+        super(DictationApp, self).__init__("Dictation App", icon="icon.png")
+        print(f"MAIN_APP: App initialized with icon='icon.png'")
+        # Initialize transcription history (session only)
+        self.transcription_history = TranscriptionHistory()
 
-        print(f"MAIN_APP: STATUS_USE_ICON={STATUS_USE_ICON}, STATUS_TITLE='{STATUS_TITLE}'")
-        print(f"MAIN_APP: Final icon_path={icon_path}")
+        # Build menu with history submenu
+        self.menu = [
+            "Toggle Dictation",
+            ("Recent Transcriptions", self._build_history_menu_items()),
+            None,
+            "Settings",
+            None,
+            "Quit"
+        ]
 
-        super(DictationApp, self).__init__(
-            "Dictation App",
-            title=STATUS_TITLE if STATUS_TITLE else None,
-            icon=str(icon_path) if icon_path and icon_path.exists() else None,
-            template=False,  # Changed from True - template icons need special format
-        )
-        # If no title and no icon, set a fallback title
-        if not STATUS_TITLE and not (icon_path and icon_path.exists()):
-            self.title = "YT"
-            print("MAIN_APP: No icon or title, using fallback 'YT'")
-        else:
-            self.title = STATUS_TITLE
-        print(f"MAIN_APP: App initialized with title='{self.title}', icon='{self.icon}'")
-        self.menu = ["Toggle Dictation", "Settings", None, "Quit"]
-        
         self.dictation_active = False
         self.is_transcribing = False
 
@@ -196,12 +316,19 @@ class DictationApp(rumps.App):
         self.hotkey_string = self.settings_manager.get_hotkey()
         self.preferences_window = None  # Lazy initialization
 
+        # Initialize correction window for reviewing transcriptions
+        self.correction_window = CorrectionWindow(
+            on_send=self._on_correction_send,
+            on_cancel=self._on_correction_cancel
+        )
+
         # Silence detection settings for auto-send
         self.silence_threshold = 150  # RMS level below which audio is considered silence (lowered from 500)
         self.silence_duration = 2.0   # Seconds of silence before auto-sending
         self._last_sound_time = None  # Timestamp of last non-silent audio
         self._auto_stop_pending = False  # Prevent multiple auto-stops
-        
+        self._waiting_for_correction = False  # True while correction window is open
+
         self.asr_model_status = "initializing" # "initializing", "loaded", "error"
         # Flag to ensure MODEL_LOADED_SUCCESSFULLY is handled only once
         self._model_loaded_handled = False
@@ -228,7 +355,15 @@ class DictationApp(rumps.App):
         
         print(f"MAIN_APP: Using model path: {model_path}")
         self.asr_service = ASRService(model_path=model_path, result_callback=self._handle_asr_service_result)
-        
+
+        # Initialize live transcription service for preview during recording
+        # Note: Currently disabled by default - can be enabled in settings later
+        self.live_transcription_enabled = False  # Toggle for live preview feature
+        self.live_transcription_service = LiveTranscriptionService(
+            asr_service=self.asr_service,
+            on_preview=self._on_live_preview
+        )
+
         # Initialize hotkey manager but don't start it yet
         self.hotkey_manager = HotkeyManager(
             hotkey_str=self.hotkey_string,
@@ -247,7 +382,9 @@ class DictationApp(rumps.App):
         self._setup_settings_shortcut()
 
         # Set up application menu (YardTalk menu) with Settings item
+        # Also set as app delegate for Dock menu support
         self._menu_handler = AppMenuHandler.alloc().init()
+        NSApplication.sharedApplication().setDelegate_(self._menu_handler)
         rumps.Timer(self._setup_app_menu, 0.5).start()
 
         # Initial menu state is set above, will be updated by ASR callback
@@ -270,10 +407,16 @@ class DictationApp(rumps.App):
         try:
             if setup_app_menu(self._menu_handler):
                 print("MAIN_APP: Application menu configured with Settings")
+                # Verify recent_submenu was set
+                has_submenu = hasattr(self._menu_handler, 'recent_submenu')
+                submenu_value = getattr(self._menu_handler, 'recent_submenu', None)
+                print(f"HISTORY DEBUG: After setup_app_menu - has recent_submenu: {has_submenu}, value: {submenu_value}")
             else:
                 print("MAIN_APP: Could not configure application menu")
         except Exception as e:
             print(f"MAIN_APP: Error setting up app menu: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             timer.stop()  # Make this a one-shot timer
 
@@ -331,6 +474,10 @@ class DictationApp(rumps.App):
             self.overlay_window.add_chunk(chunk)
         else:
             print("MAIN_APP: WARNING - overlay_window is None, can't add chunk")
+
+        # Feed to live transcription service if active
+        if self.live_transcription_service.is_active:
+            self.live_transcription_service.add_audio_chunk(chunk)
 
         # Silence detection for auto-send
         if self.dictation_active and not self._auto_stop_pending:
@@ -470,27 +617,16 @@ class DictationApp(rumps.App):
                         return # Return directly from here. The finally block will still execute.
                     elif transcribed_text is not None: # We already checked for blank, so this means non-blank
                         if transcribed_text == self._last_transcribed_text:
-                            pass 
+                            pass
                         else:
                             print("--- Transcribed Text ---")
                             print(transcribed_text)
                             print("------------------------")
-                            try:
-                                print(f"MAIN_APP ({log_id}): Attempting to insert text...")
-                                insertion_result = self.text_insertion_service.insert_text(transcribed_text)
-                                print(f"MAIN_APP ({log_id}): Text insertion result: {insertion_result}")
-                                if insertion_result:
-                                    rumps.notification("Transcription Complete", "Text inserted.", transcribed_text)
-                                else:
-                                    rumps.notification("Insertion Failed", "Could not type text.", transcribed_text)
-                                    rumps.alert("Transcription (Insertion Failed)", transcribed_text)
-                            except Exception as insertion_error:
-                                print(f"MAIN_APP ({log_id}): ERROR during text insertion: {insertion_error}")
-                                import traceback
-                                traceback.print_exc()
-                                rumps.notification("Insertion Error", f"Text insertion crashed: {str(insertion_error)}", transcribed_text)
-                                rumps.alert("Transcription (Insertion Error)", f"Error: {str(insertion_error)}\n\nText: {transcribed_text}")
-                            self._last_transcribed_text = transcribed_text
+                            # Show correction window instead of immediate insertion
+                            print(f"MAIN_APP ({log_id}): Showing correction window for review...")
+                            self._waiting_for_correction = True
+                            self._pending_transcription_text = transcribed_text  # Store for cancel handler
+                            AppHelper.callAfter(self.correction_window.show, transcribed_text)
                     # No explicit 'else' for transcribed_text == "" here as we return early if blank
                 finally:
                     # This 'finally' is for the inner try related to processing transcription text and errors.
@@ -511,26 +647,30 @@ class DictationApp(rumps.App):
 
             # This is the outer finally, ensure state flags are reset here if a transcription was processed (or attempted)
             # Only reset these if it was a transcription callback, not a model_load callback.
+            # Also skip if correction window is open (state will be reset by correction callbacks)
             if callback_type == ASR_CALLBACK_TYPE_TRANSCRIPTION:
-                print(f"MAIN_APP ({log_id}): Outer FINALLY for ASR_CALLBACK_TYPE_TRANSCRIPTION. is_transcribing PRE: {self.is_transcribing}, dictation_active PRE: {self.dictation_active}")
-                self.is_transcribing = False 
-                self.dictation_active = False
-                
-                current_hotkey_active_state = self.hotkey_manager.hotkey_active
-                print(f"MAIN_APP ({log_id}): Hotkey_manager.hotkey_active PRE-check: {current_hotkey_active_state}")
-                if self.hotkey_manager.hotkey_active:
-                    print(f"MAIN_APP ({log_id}): Resetting hotkey_manager.hotkey_active from True to False.")
-                    self.hotkey_manager.hotkey_active = False
-                
-                audio_is_recording_flag = getattr(self.audio_manager, "_is_recording", "N/A")
-                print(f"MAIN_APP ({log_id}): AudioManager._is_recording PRE-check: {audio_is_recording_flag}")
-                if audio_is_recording_flag == True:
-                    print(f"MAIN_APP ({log_id}): Cleanup – mic was still flagged recording; stopping.")
-                    self.audio_manager.stop_recording(f"from_process_asr_result_finally_{log_id}")
-                    if self.overlay_window:
-                        AppHelper.callAfter(self.overlay_window.hide)
-                
-                print(f"MAIN_APP ({log_id}): is_transcribing POST: {self.is_transcribing}, dictation_active POST: {self.dictation_active}")
+                if self._waiting_for_correction:
+                    print(f"MAIN_APP ({log_id}): Outer FINALLY - Correction window open, skipping state reset.")
+                else:
+                    print(f"MAIN_APP ({log_id}): Outer FINALLY for ASR_CALLBACK_TYPE_TRANSCRIPTION. is_transcribing PRE: {self.is_transcribing}, dictation_active PRE: {self.dictation_active}")
+                    self.is_transcribing = False
+                    self.dictation_active = False
+
+                    current_hotkey_active_state = self.hotkey_manager.hotkey_active
+                    print(f"MAIN_APP ({log_id}): Hotkey_manager.hotkey_active PRE-check: {current_hotkey_active_state}")
+                    if self.hotkey_manager.hotkey_active:
+                        print(f"MAIN_APP ({log_id}): Resetting hotkey_manager.hotkey_active from True to False.")
+                        self.hotkey_manager.hotkey_active = False
+
+                    audio_is_recording_flag = getattr(self.audio_manager, "_is_recording", "N/A")
+                    print(f"MAIN_APP ({log_id}): AudioManager._is_recording PRE-check: {audio_is_recording_flag}")
+                    if audio_is_recording_flag == True:
+                        print(f"MAIN_APP ({log_id}): Cleanup – mic was still flagged recording; stopping.")
+                        self.audio_manager.stop_recording(f"from_process_asr_result_finally_{log_id}")
+                        if self.overlay_window:
+                            AppHelper.callAfter(self.overlay_window.hide)
+
+                    print(f"MAIN_APP ({log_id}): is_transcribing POST: {self.is_transcribing}, dictation_active POST: {self.dictation_active}")
             else:
                 print(f"MAIN_APP ({log_id}): Outer FINALLY for {callback_type}. Not resetting transcription-specific flags.")
 
@@ -582,8 +722,17 @@ class DictationApp(rumps.App):
             if self.overlay_window:
                 print(f"MAIN_APP ({log_id}): Showing overlay window...")
                 self.overlay_window.show()  # Call directly - we're already on main thread
+                # Enable live preview if feature is enabled
+                if self.live_transcription_enabled:
+                    self.overlay_window.set_live_preview_enabled(True)
             else:
                 print(f"MAIN_APP ({log_id}): WARNING - overlay_window is None!")
+
+            # Start live transcription if enabled
+            if self.live_transcription_enabled:
+                print(f"MAIN_APP ({log_id}): Starting live transcription service...")
+                self.live_transcription_service.start()
+
             self.audio_manager.set_chunk_callback(self._process_audio_chunk)
             print(f"MAIN_APP ({log_id}): Calling audio_manager.start_recording().")
             if self.audio_manager.start_recording(f"from_activate_{log_id}"):
@@ -654,7 +803,16 @@ class DictationApp(rumps.App):
         print(f"MAIN_APP ({log_id}): dictation_active SET to False.")
         print(f"MAIN_APP ({log_id}): Calling audio_manager.stop_recording().")
         self.audio_manager.stop_recording(f"from_deactivate_active_{log_id}")
+
+        # Stop live transcription if active
+        if self.live_transcription_service.is_active:
+            print(f"MAIN_APP ({log_id}): Stopping live transcription service...")
+            self.live_transcription_service.stop()
+
         if self.overlay_window:
+            # Disable live preview before hiding
+            if self.overlay_window.live_preview_enabled:
+                AppHelper.callAfter(self.overlay_window.set_live_preview_enabled, False)
             AppHelper.callAfter(self.overlay_window.hide)
         print(f"MAIN_APP ({log_id}): Audio recording stopped call returned.")
 
@@ -716,6 +874,178 @@ class DictationApp(rumps.App):
 
         if toggle_item and toggle_item.title != menu_item_title:
             toggle_item.title = menu_item_title
+
+    def _build_history_menu_items(self) -> list:
+        """Build the Recent Transcriptions submenu items."""
+        entries = self.transcription_history.get_entries()
+
+        if not entries:
+            # Return a disabled placeholder item
+            placeholder = rumps.MenuItem("No transcriptions yet")
+            placeholder.set_callback(None)
+            return [placeholder]
+
+        items = []
+        for entry in entries:
+            # Create menu item with closure to capture the entry
+            def make_callback(e):
+                return lambda sender: self._copy_history_entry(e)
+
+            item = rumps.MenuItem(entry.menu_title(), callback=make_callback(entry))
+            items.append(item)
+
+        # Add separator and clear option
+        items.append(None)  # Separator
+        items.append(rumps.MenuItem("Clear History", callback=self._clear_history))
+
+        return items
+
+    def _copy_history_entry(self, entry):
+        """Copy a history entry to clipboard."""
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(entry.display_text, NSPasteboardTypeString)
+
+        preview = entry.display_text[:50]
+        if len(entry.display_text) > 50:
+            preview += "..."
+        rumps.notification("Copied to Clipboard", "", preview)
+
+    def _clear_history(self, _):
+        """Clear all history entries."""
+        self.transcription_history.clear()
+        self._update_history_menu()
+        rumps.notification("History Cleared", "", "")
+
+    def _update_history_menu(self):
+        """Refresh the Recent Transcriptions submenu (both rumps and native menus)."""
+        print("HISTORY DEBUG: _update_history_menu() called")
+
+        # Update rumps menu
+        history_menu = self.menu.get("Recent Transcriptions")
+        if history_menu is not None:
+            history_menu.clear()
+            new_items = self._build_history_menu_items()
+            for item in new_items:
+                if item is None:
+                    history_menu.add(rumps.separator)
+                else:
+                    history_menu.add(item)
+            print(f"HISTORY DEBUG: Updated rumps menu with {len(new_items)} items")
+
+        # Update native menu bar (Dictation > Recent Transcriptions)
+        print(f"HISTORY DEBUG: hasattr _menu_handler: {hasattr(self, '_menu_handler')}")
+        if hasattr(self, '_menu_handler'):
+            print(f"HISTORY DEBUG: hasattr recent_submenu: {hasattr(self._menu_handler, 'recent_submenu')}")
+
+        if hasattr(self, '_menu_handler') and hasattr(self._menu_handler, 'recent_submenu'):
+            native_menu = self._menu_handler.recent_submenu
+            print(f"HISTORY DEBUG: native_menu object: {native_menu}")
+            if native_menu:
+                # Clear existing items
+                native_menu.removeAllItems()
+
+                entries = list(self.transcription_history.get_entries())
+                print(f"HISTORY DEBUG: Found {len(entries)} entries to display")
+                if not entries:
+                    placeholder = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                        "No transcriptions yet", "", ""
+                    )
+                    placeholder.setEnabled_(False)
+                    native_menu.addItem_(placeholder)
+                    print("HISTORY DEBUG: Added placeholder (no entries)")
+                else:
+                    for entry in entries:
+                        print(f"HISTORY DEBUG: Adding menu item: '{entry.menu_title()}'")
+                        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                            entry.menu_title(), "copyHistoryEntry:", ""
+                        )
+                        item.setTarget_(self._menu_handler)
+                        item.setRepresentedObject_(entry)
+                        native_menu.addItem_(item)
+
+                    # Add separator and clear option
+                    native_menu.addItem_(NSMenuItem.separatorItem())
+                    clear_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                        "Clear History", "clearHistory:", ""
+                    )
+                    clear_item.setTarget_(self._menu_handler)
+                    native_menu.addItem_(clear_item)
+
+                print(f"HISTORY DEBUG: Native menu now has {native_menu.numberOfItems()} items")
+        else:
+            print("HISTORY DEBUG: WARNING - _menu_handler or recent_submenu not found!")
+
+    def _add_to_history(self, original_text: str, corrected_text: str = None, discarded: bool = False):
+        """Add transcription to history and update menu."""
+        status = "discarded" if discarded else "inserted"
+        print(f"HISTORY DEBUG: _add_to_history called ({status}): '{original_text[:30]}...'")
+        self.transcription_history.add(original_text, corrected_text, discarded=discarded)
+        entry_count = len(list(self.transcription_history.get_entries()))
+        print(f"HISTORY DEBUG: History now has {entry_count} entries")
+        print(f"HISTORY DEBUG: Scheduling _update_history_menu via AppHelper.callAfter")
+        AppHelper.callAfter(self._update_history_menu)
+
+    def _on_correction_send(self, original_text: str, corrected_text: str):
+        """Called when user confirms corrected text in the correction window."""
+        print(f"MAIN_APP: Correction confirmed. Original: '{original_text[:30]}...', Corrected: '{corrected_text[:30]}...'")
+
+        # Restore focus to the original app BEFORE inserting text
+        self.correction_window.restore_previous_app_focus()
+
+        # Add to history with both original and corrected
+        self._add_to_history(original_text, corrected_text)
+
+        # Insert the corrected text
+        try:
+            insertion_result = self.text_insertion_service.insert_text(corrected_text)
+            if insertion_result:
+                rumps.notification("Transcription Complete", "Text inserted.", corrected_text[:50])
+            else:
+                rumps.notification("Insertion Failed", "Could not type text.", corrected_text[:50])
+        except Exception as e:
+            print(f"MAIN_APP: Error during text insertion: {e}")
+            rumps.notification("Insertion Error", str(e)[:50], corrected_text[:50])
+
+        self._last_transcribed_text = corrected_text
+        self._pending_transcription_text = None  # Clear pending text
+        self._finish_transcription_cycle()
+
+    def _on_correction_cancel(self):
+        """Called when user cancels/discards transcription in the correction window."""
+        print("MAIN_APP: Transcription discarded by user")
+
+        # Save discarded transcription to history for recovery
+        if hasattr(self, '_pending_transcription_text') and self._pending_transcription_text:
+            self._add_to_history(self._pending_transcription_text, discarded=True)
+            self._pending_transcription_text = None
+
+        rumps.notification("Transcription Discarded", "Saved to history for recovery.", "")
+        self._finish_transcription_cycle()
+
+    def _on_live_preview(self, preview_text: str):
+        """Called when live preview text is available."""
+        print(f"MAIN_APP: Live preview: '{preview_text[:50]}...'")
+        if self.overlay_window:
+            self.overlay_window.set_preview_text(preview_text)
+
+    def _finish_transcription_cycle(self):
+        """Clean up state after transcription cycle (send or cancel)."""
+        self._waiting_for_correction = False
+        self.is_transcribing = False
+        self.dictation_active = False
+
+        if self.hotkey_manager.hotkey_active:
+            self.hotkey_manager.hotkey_active = False
+
+        # Cleanup mic if still recording
+        audio_is_recording = getattr(self.audio_manager, "_is_recording", False)
+        if audio_is_recording:
+            self.audio_manager.stop_recording("from_finish_transcription_cycle")
+            if self.overlay_window:
+                AppHelper.callAfter(self.overlay_window.hide)
+
+        self.update_menu_state()
 
     @rumps.clicked("Toggle Dictation")
     def toggle_dictation_manual(self, _):

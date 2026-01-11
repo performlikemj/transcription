@@ -123,7 +123,7 @@ PY2APP_OPTS = dict(
         "CFBundleShortVersionString": "0.1.0",
         "CFBundleVersion":            "0.1.0",
         "LSMinimumSystemVersion":     "13.0",
-        "LSUIElement":                False,  # Show in Dock since menu bar not working on macOS 26
+        "LSUIElement":                False,  # Dock app (shows in Dock)
         "NSMainNibFile":              "",    # No nib - rumps creates UI programmatically
         "NSMicrophoneUsageDescription":
             "Speech to text for YardTalk",

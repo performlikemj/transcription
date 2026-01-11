@@ -5,20 +5,25 @@ Uses PyObjC/AppKit for thread-safe integration with rumps.
 
 import objc
 from AppKit import (
-    NSWindow, NSView, NSColor, NSBezierPath,
+    NSWindow, NSView, NSColor, NSBezierPath, NSFont,
     NSWindowStyleMaskBorderless, NSBackingStoreBuffered,
     NSWindowCollectionBehaviorCanJoinAllSpaces,
     NSWindowCollectionBehaviorStationary,
-    NSFloatingWindowLevel, NSScreen
+    NSFloatingWindowLevel, NSScreen,
+    NSFontAttributeName, NSForegroundColorAttributeName,
+    NSParagraphStyleAttributeName, NSMutableParagraphStyle,
+    NSCenterTextAlignment
 )
-from Foundation import NSRect, NSPoint, NSSize, NSTimer, NSRunLoop, NSDefaultRunLoopMode
+from Foundation import NSRect, NSPoint, NSSize, NSTimer, NSRunLoop, NSDefaultRunLoopMode, NSString
 import numpy as np
 from collections import deque
 import threading
 
 # Constants
 WINDOW_WIDTH = 400
-WINDOW_HEIGHT = 70
+WAVEFORM_HEIGHT = 70
+PREVIEW_TEXT_HEIGHT = 35
+WINDOW_HEIGHT = WAVEFORM_HEIGHT + PREVIEW_TEXT_HEIGHT  # Total height when live preview is shown
 BUFFER_SAMPLES = 8000  # 0.5 seconds at 16kHz
 REFRESH_INTERVAL = 1.0 / 30  # 30 FPS
 NUM_BARS = 60  # Number of vertical bars
@@ -186,29 +191,94 @@ class WaveformView(NSView):
             bar_path.fill()
 
 
+class LiveTextView(NSView):
+    """Custom NSView for displaying live transcription preview text."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(LiveTextView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+
+        self._text = ""
+        self._lock = threading.Lock()
+        return self
+
+    def isOpaque(self):
+        return False
+
+    def setText_(self, text):
+        """Set the preview text (thread-safe)."""
+        with self._lock:
+            self._text = text
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, rect):
+        """Draw the text with a semi-transparent background."""
+        with self._lock:
+            text = self._text
+
+        # Draw semi-transparent background
+        bg_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.12, 0.12, 0.12, 0.92
+        )
+        bg_color.setFill()
+
+        bg_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+            rect, 10, 10
+        )
+        bg_path.fill()
+
+        if not text:
+            return
+
+        # Draw text centered
+        text_font = NSFont.systemFontOfSize_(13)
+        text_color = NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            0.85, 0.85, 0.85, 1.0
+        )
+
+        # Set up paragraph style for centering
+        para_style = NSMutableParagraphStyle.alloc().init()
+        para_style.setAlignment_(NSCenterTextAlignment)
+
+        text_attrs = {
+            NSFontAttributeName: text_font,
+            NSForegroundColorAttributeName: text_color,
+            NSParagraphStyleAttributeName: para_style,
+        }
+
+        ns_string = NSString.stringWithString_(text)
+        text_size = ns_string.sizeWithAttributes_(text_attrs)
+
+        # Center vertically, use padding horizontally
+        text_y = (rect.size.height - text_size.height) / 2
+        text_rect = NSRect(
+            NSPoint(10, text_y),
+            NSSize(rect.size.width - 20, text_size.height)
+        )
+
+        ns_string.drawInRect_withAttributes_(text_rect, text_attrs)
+
+
 class OverlayWindow:
     """Manages the floating overlay window for waveform display"""
 
     def __init__(self):
         self._window = None
         self._waveform_view = None
+        self._live_text_view = None
+        self._container_view = None
         self._is_visible = False
+        self._live_preview_enabled = False
         self._setup_window()
 
     def _setup_window(self):
         """Create and configure the overlay window"""
-        # Calculate position (bottom center of main screen)
-        screen = NSScreen.mainScreen()
-        if screen is None:
-            x, y = 100, 100
-        else:
-            screen_frame = screen.frame()
-            x = (screen_frame.size.width - WINDOW_WIDTH) / 2
-            y = 80  # 80px from bottom
-
+        # Start with just waveform height (live preview adds more when enabled)
+        # Position will be set with center() after window creation
         frame = NSRect(
-            NSPoint(x, y),
-            NSSize(WINDOW_WIDTH, WINDOW_HEIGHT)
+            NSPoint(0, 0),
+            NSSize(WINDOW_WIDTH, WAVEFORM_HEIGHT)
         )
 
         # Create borderless, transparent window
@@ -230,14 +300,52 @@ class OverlayWindow:
         )
         self._window.setHasShadow_(True)
 
-        # Create and add waveform view
-        view_frame = NSRect(NSPoint(0, 0), NSSize(WINDOW_WIDTH, WINDOW_HEIGHT))
-        self._waveform_view = WaveformView.alloc().initWithFrame_(view_frame)
-        self._window.setContentView_(self._waveform_view)
+        # Create container view
+        container_frame = NSRect(NSPoint(0, 0), NSSize(WINDOW_WIDTH, WINDOW_HEIGHT))
+        self._container_view = NSView.alloc().initWithFrame_(container_frame)
+        self._container_view.setWantsLayer_(True)
+
+        # Create waveform view at top of container
+        waveform_frame = NSRect(
+            NSPoint(0, PREVIEW_TEXT_HEIGHT),
+            NSSize(WINDOW_WIDTH, WAVEFORM_HEIGHT)
+        )
+        self._waveform_view = WaveformView.alloc().initWithFrame_(waveform_frame)
+        self._container_view.addSubview_(self._waveform_view)
+
+        # Create live text view at bottom (hidden by default)
+        text_frame = NSRect(
+            NSPoint(0, 0),
+            NSSize(WINDOW_WIDTH, PREVIEW_TEXT_HEIGHT)
+        )
+        self._live_text_view = LiveTextView.alloc().initWithFrame_(text_frame)
+        self._live_text_view.setHidden_(True)
+        self._container_view.addSubview_(self._live_text_view)
+
+        self._window.setContentView_(self._container_view)
+
+        # Manually center the window (center() is broken on macOS 26)
+        screen = NSScreen.mainScreen()
+        if screen:
+            vf = screen.visibleFrame()
+            # Calculate center position within visible frame
+            x = vf.origin.x + (vf.size.width - WINDOW_WIDTH) / 2
+            y = vf.origin.y + (vf.size.height - WAVEFORM_HEIGHT) / 2
+
+            print(f"OVERLAY DEBUG: Visible frame: origin=({vf.origin.x}, {vf.origin.y}), size=({vf.size.width}, {vf.size.height})")
+            print(f"OVERLAY DEBUG: Calculated center: ({x}, {y})")
+
+            # Set the window position
+            self._window.setFrameOrigin_(NSPoint(x, y))
+
+            frame = self._window.frame()
+            print(f"OVERLAY DEBUG: Window frame after setFrameOrigin: origin=({frame.origin.x}, {frame.origin.y})")
 
     def show(self):
         """Show window and start refresh timer (call on main thread)"""
-        print(f"OVERLAY: show() called, was_visible={self._is_visible}")
+        # Debug: check window position at show time
+        frame = self._window.frame()
+        print(f"OVERLAY: show() called, was_visible={self._is_visible}, window_pos=({frame.origin.x}, {frame.origin.y})")
         if self._is_visible:
             print("OVERLAY: Already visible, returning early")
             return
@@ -290,3 +398,56 @@ class OverlayWindow:
             self._waveform_view.addChunk_(chunk_float)
         except Exception as e:
             print(f"OVERLAY_WINDOW: Error adding chunk: {e}")
+
+    def set_live_preview_enabled(self, enabled: bool):
+        """Enable or disable live preview mode (call on main thread)."""
+        if self._live_preview_enabled == enabled:
+            return
+
+        print(f"OVERLAY: set_live_preview_enabled({enabled})")
+        self._live_preview_enabled = enabled
+
+        if self._live_text_view:
+            self._live_text_view.setHidden_(not enabled)
+            # Clear text when disabling
+            if not enabled:
+                self._live_text_view.setText_("")
+
+        # Resize window to show/hide text area
+        current_frame = self._window.frame()
+        if enabled:
+            new_height = WINDOW_HEIGHT
+            # Move waveform up to make room for text
+            waveform_frame = NSRect(
+                NSPoint(0, PREVIEW_TEXT_HEIGHT),
+                NSSize(WINDOW_WIDTH, WAVEFORM_HEIGHT)
+            )
+        else:
+            new_height = WAVEFORM_HEIGHT
+            # Move waveform to bottom when no text
+            waveform_frame = NSRect(
+                NSPoint(0, 0),
+                NSSize(WINDOW_WIDTH, WAVEFORM_HEIGHT)
+            )
+
+        if self._waveform_view:
+            self._waveform_view.setFrame_(waveform_frame)
+
+        new_frame = NSRect(
+            current_frame.origin,
+            NSSize(WINDOW_WIDTH, new_height)
+        )
+        self._window.setFrame_display_(new_frame, True)
+
+    def set_preview_text(self, text: str):
+        """Set the live preview text (can be called from any thread)."""
+        if self._live_text_view and self._live_preview_enabled:
+            # Truncate long text
+            if len(text) > 100:
+                text = text[:97] + "..."
+            self._live_text_view.setText_(text)
+
+    @property
+    def live_preview_enabled(self):
+        """Return whether live preview is currently enabled."""
+        return self._live_preview_enabled
