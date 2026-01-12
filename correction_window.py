@@ -6,6 +6,18 @@ Uses PyObjC/AppKit for native macOS integration.
 
 import objc
 import time
+import logging
+
+# Use the same logging as main.py
+logger = logging.getLogger('CorrectionWindow')
+
+def log_print(*args):
+    """Log to the shared log file"""
+    message = ' '.join(str(arg) for arg in args)
+    logger.info(message)
+
+# Use log_print for all prints in this module
+print = log_print
 from AppKit import (
     NSWindow, NSView, NSTextField, NSButton, NSTextView, NSScrollView,
     NSWindowStyleMaskTitled, NSWindowStyleMaskClosable, NSWindowStyleMaskResizable,
@@ -28,7 +40,7 @@ MIN_WINDOW_HEIGHT = 300
 
 # Layout constants
 PADDING = 20
-TOOLBAR_HEIGHT = 44
+TOOLBAR_HEIGHT = 56
 STATUS_BAR_HEIGHT = 28
 BUTTON_HEIGHT = 32
 BUTTON_WIDTH = 100
@@ -158,6 +170,7 @@ class CorrectionWindow:
         self._delegate = None
         self._status_label = None
         self._instruction_label = None
+        self._target_app_label = None
         self._on_send_callback = on_send
         self._on_cancel_callback = on_cancel
         self._original_text = ""
@@ -305,7 +318,7 @@ class CorrectionWindow:
         )
 
         # Instruction label on the left
-        instruction_frame = NSRect(NSPoint(0, 12), NSSize(width - 200, 20))
+        instruction_frame = NSRect(NSPoint(0, 24), NSSize(width - 200, 20))
         self._instruction_label = NSTextField.alloc().initWithFrame_(instruction_frame)
         self._instruction_label.setStringValue_("Edit your transcription. Press Enter to insert, Escape to cancel.")
         self._instruction_label.setBezeled_(False)
@@ -315,6 +328,20 @@ class CorrectionWindow:
         self._instruction_label.setTextColor_(NSColor.secondaryLabelColor())
         self._instruction_label.setFont_(NSFont.systemFontOfSize_(12))
         toolbar_view.addSubview_(self._instruction_label)
+
+        # Target app indicator (below instruction)
+        target_app_frame = NSRect(NSPoint(0, 6), NSSize(width - 200, 16))
+        self._target_app_label = NSTextField.alloc().initWithFrame_(target_app_frame)
+        self._target_app_label.setStringValue_("")
+        self._target_app_label.setBezeled_(False)
+        self._target_app_label.setDrawsBackground_(False)
+        self._target_app_label.setEditable_(False)
+        self._target_app_label.setSelectable_(False)
+        # Use secondaryLabelColor for better visibility (tertiaryLabelColor was too subtle)
+        self._target_app_label.setTextColor_(NSColor.secondaryLabelColor())
+        self._target_app_label.setFont_(NSFont.systemFontOfSize_(11))
+        toolbar_view.addSubview_(self._target_app_label)
+        print(f"CORRECTION: Created _target_app_label with frame: {target_app_frame}")
 
         # Copy button on the right
         copy_frame = NSRect(NSPoint(width - 160, 6), NSSize(70, 28))
@@ -425,8 +452,16 @@ class CorrectionWindow:
         corrected_text = self._text_view.string()
         print(f"CORRECTION: Insert clicked. Original: '{self._original_text[:30]}...', Corrected: '{corrected_text[:30]}...'")
 
-        self.hide()
+        # Hide window immediately
+        self._is_visible = False
+        self._window.orderOut_(None)
 
+        # Schedule callback for next event loop iteration (allows window to disappear first)
+        from PyObjCTools import AppHelper
+        AppHelper.callAfter(self._execute_send_callback, corrected_text)
+
+    def _execute_send_callback(self, corrected_text):
+        """Execute send callback after window is hidden."""
         if self._on_send_callback:
             self._on_send_callback(self._original_text, corrected_text)
 
@@ -483,8 +518,23 @@ class CorrectionWindow:
         self._original_text = text
         self._current_text = text
 
-        # Ensure layout is fresh
+        # Ensure layout is fresh (this recreates all UI elements)
         self._layout_views()
+
+        # Update target app label AFTER _layout_views() since it recreates the label
+        print(f"CORRECTION: _target_app_label exists: {self._target_app_label is not None}")
+        print(f"CORRECTION: _previous_app exists: {self._previous_app is not None}")
+        if self._target_app_label:
+            if self._previous_app:
+                app_name = self._previous_app.localizedName()
+                label_text = f"Insert into: {app_name}"
+                self._target_app_label.setStringValue_(label_text)
+                print(f"CORRECTION: Set target app label to: '{label_text}'")
+                print(f"CORRECTION: Label frame: {self._target_app_label.frame()}")
+                print(f"CORRECTION: Label superview: {self._target_app_label.superview()}")
+            else:
+                self._target_app_label.setStringValue_("Insert into: (unknown)")
+                print("CORRECTION: Set target app label to: 'Insert into: (unknown)'")
 
         # Set the text in the text view
         self._text_view.setString_(text)
@@ -531,6 +581,87 @@ class CorrectionWindow:
             self._previous_app.activateWithOptions_(0)
             time.sleep(0.1)  # Small delay for focus to settle
             self._previous_app = None
+
+    def copy_to_clipboard(self, text: str) -> bool:
+        """
+        Copy text to clipboard silently (no UI feedback).
+
+        Args:
+            text: Text to copy
+
+        Returns:
+            True if copy succeeded, False otherwise
+        """
+        if not text:
+            return False
+        try:
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            print(f"CORRECTION: Silently copied {len(text)} characters to clipboard")
+            return True
+        except Exception as e:
+            print(f"CORRECTION: Failed to copy to clipboard: {e}")
+            return False
+
+    def get_target_app_name(self) -> str:
+        """Return the name of the target app, or empty string if unknown."""
+        if self._previous_app:
+            return self._previous_app.localizedName()
+        return ""
+
+    def get_target_app_bundle_id(self) -> str:
+        """Return the bundle identifier of the target app, or empty string if unknown."""
+        if self._previous_app:
+            return self._previous_app.bundleIdentifier() or ""
+        return ""
+
+    def is_target_likely_text_accepting(self) -> bool:
+        """
+        Heuristic check: is the target app likely to accept text input?
+
+        Returns False for apps known to not have text fields (Desktop, Finder windows, etc.)
+        Returns True for apps that typically have text input.
+
+        This is a heuristic - we can't know for certain if the cursor is in a text field.
+        """
+        if not self._previous_app:
+            print("CORRECTION: No previous app - assuming NOT text-accepting")
+            return False
+
+        bundle_id = self._previous_app.bundleIdentifier() or ""
+        app_name = self._previous_app.localizedName() or ""
+
+        # Apps that typically don't accept arbitrary text input
+        non_text_apps = {
+            # System apps
+            "com.apple.finder",  # Finder (Desktop, file browser)
+            "com.apple.dock.extra",  # Dock
+            "com.apple.loginwindow",  # Login screen
+            "com.apple.SecurityAgent",  # Password dialogs
+            "com.apple.systempreferences",  # System Preferences
+            "com.apple.systempreferences.extensions",
+            # Desktop window server
+            "com.apple.WindowServer",
+        }
+
+        # Check bundle ID
+        if bundle_id in non_text_apps:
+            print(f"CORRECTION: Target app '{app_name}' ({bundle_id}) is in non-text-apps list")
+            return False
+
+        # Special check for Finder - even if not in desktop, text input is rare
+        if bundle_id == "com.apple.finder":
+            print(f"CORRECTION: Target is Finder - likely NOT text-accepting")
+            return False
+
+        # If bundle ID is empty or unknown, be cautious
+        if not bundle_id:
+            print(f"CORRECTION: Target app '{app_name}' has no bundle ID - assuming NOT text-accepting")
+            return False
+
+        print(f"CORRECTION: Target app '{app_name}' ({bundle_id}) is likely text-accepting")
+        return True
 
     @property
     def is_visible(self):

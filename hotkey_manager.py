@@ -71,32 +71,27 @@ class HotkeyManager:
             print(f"HOTKEY_MANAGER: Failed to parse hotkey '{self.hotkey_str}': {e}")
 
     def _check_accessibility_permissions(self):
-        """Check if the app has accessibility permissions on macOS"""
-        if sys.platform == "darwin":
-            try:
-                # Try to check accessibility permissions using AppleScript
-                script = '''
-                tell application "System Events"
-                    return true
-                end tell
-                '''
-                result = subprocess.run(
-                    ["osascript", "-e", script],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                if result.returncode != 0:
-                    print("HOTKEY_MANAGER: WARNING - Accessibility permissions may not be granted.")
-                    print("HOTKEY_MANAGER: Please grant accessibility permissions in System Preferences > Security & Privacy > Privacy > Accessibility")
-                    return False
-                else:
-                    print("HOTKEY_MANAGER: Accessibility permissions appear to be granted.")
-                    return True
-            except Exception as e:
-                print(f"HOTKEY_MANAGER: Could not check accessibility permissions: {e}")
+        """Check if the app has accessibility permissions on macOS using native API."""
+        if sys.platform != "darwin":
+            return True
+
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            is_trusted = AXIsProcessTrusted()
+            if is_trusted:
+                print("HOTKEY_MANAGER: Accessibility permissions granted.")
+                return True
+            else:
+                print("HOTKEY_MANAGER: WARNING - Accessibility permissions NOT granted.")
+                print("HOTKEY_MANAGER: Please grant in System Settings > Privacy & Security > Accessibility")
                 return False
-        return True
+        except ImportError:
+            # Fallback if ApplicationServices not available
+            print("HOTKEY_MANAGER: Could not check accessibility permissions (API unavailable)")
+            return True
+        except Exception as e:
+            print(f"HOTKEY_MANAGER: Error checking accessibility permissions: {e}")
+            return False
 
     def on_press(self):
         # This function will be registered with GlobalHotKeys

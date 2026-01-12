@@ -67,22 +67,110 @@ from asr_service import ASRService
 from text_insertion_service import TextInsertionService
 from overlay_window import OverlayWindow
 from settings_manager import SettingsManager
-from preferences_window import PreferencesWindow
+from preferences_window import PreferencesWindow, hotkey_to_display
 from transcription_history import TranscriptionHistory
 from correction_window import CorrectionWindow
 from live_transcription_service import LiveTranscriptionService
+from help_window import HelpWindow
 import sounddevice as sd
 from PyObjCTools import AppHelper
 import time
 import numpy as np
 
-# For Dock menu support
+# For Dock menu support and toast notifications
 import objc
-from AppKit import NSApplication, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString
-from Foundation import NSObject
+from AppKit import (
+    NSApplication, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSWindow, NSView, NSTextField, NSColor, NSFont, NSScreen,
+    NSWindowStyleMaskBorderless, NSBackingStoreBuffered,
+    NSFloatingWindowLevel, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSTextAlignmentCenter
+)
+from Foundation import NSObject, NSRect, NSPoint, NSSize, NSTimer, NSRunLoop, NSDefaultRunLoopMode
 
 # Global reference to the app instance for menu callbacks
 _app_instance = None
+
+# Simple toast notification window
+_toast_window = None
+
+def _dismiss_toast():
+    """Dismiss the toast window."""
+    global _toast_window
+    if _toast_window:
+        _toast_window.orderOut_(None)
+        _toast_window = None
+        print("MAIN_APP: Toast dismissed")
+
+def show_toast(title: str, message: str, duration: float = 2.5):
+    """Show a simple floating toast notification using AppKit."""
+    global _toast_window
+
+    # Cancel any existing toast
+    if _toast_window:
+        _toast_window.orderOut_(None)
+        _toast_window = None
+
+    # Create toast window
+    screen = NSScreen.mainScreen()
+    screen_frame = screen.frame() if screen else NSRect(NSPoint(0, 0), NSSize(1920, 1080))
+
+    toast_width = 320
+    toast_height = 60
+    x = (screen_frame.size.width - toast_width) / 2
+    y = screen_frame.size.height - 120  # Near top of screen
+
+    frame = NSRect(NSPoint(x, y), NSSize(toast_width, toast_height))
+
+    _toast_window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        frame,
+        NSWindowStyleMaskBorderless,
+        NSBackingStoreBuffered,
+        False
+    )
+    _toast_window.setLevel_(NSFloatingWindowLevel + 1)
+    _toast_window.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces)
+    _toast_window.setOpaque_(False)
+    _toast_window.setBackgroundColor_(NSColor.clearColor())
+
+    # Create content view with rounded background
+    content = NSView.alloc().initWithFrame_(NSRect(NSPoint(0, 0), NSSize(toast_width, toast_height)))
+    content.setWantsLayer_(True)
+    content.layer().setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.15, 0.95).CGColor())
+    content.layer().setCornerRadius_(12)
+
+    # Title label
+    title_frame = NSRect(NSPoint(15, 30), NSSize(toast_width - 30, 22))
+    title_label = NSTextField.alloc().initWithFrame_(title_frame)
+    title_label.setStringValue_(title)
+    title_label.setBezeled_(False)
+    title_label.setDrawsBackground_(False)
+    title_label.setEditable_(False)
+    title_label.setSelectable_(False)
+    title_label.setTextColor_(NSColor.whiteColor())
+    title_label.setFont_(NSFont.boldSystemFontOfSize_(14))
+    title_label.setAlignment_(NSTextAlignmentCenter)
+    content.addSubview_(title_label)
+
+    # Message label
+    msg_frame = NSRect(NSPoint(15, 10), NSSize(toast_width - 30, 18))
+    msg_label = NSTextField.alloc().initWithFrame_(msg_frame)
+    msg_label.setStringValue_(message)
+    msg_label.setBezeled_(False)
+    msg_label.setDrawsBackground_(False)
+    msg_label.setEditable_(False)
+    msg_label.setSelectable_(False)
+    msg_label.setTextColor_(NSColor.colorWithWhite_alpha_(1.0, 0.8))
+    msg_label.setFont_(NSFont.systemFontOfSize_(12))
+    msg_label.setAlignment_(NSTextAlignmentCenter)
+    content.addSubview_(msg_label)
+
+    _toast_window.setContentView_(content)
+    _toast_window.orderFrontRegardless()
+
+    # Auto-dismiss using AppHelper.callLater
+    AppHelper.callLater(duration, _dismiss_toast)
+    print(f"MAIN_APP: Toast shown: '{title}' - '{message}'")
 
 
 class AppMenuHandler(NSObject):
@@ -98,6 +186,10 @@ class AppMenuHandler(NSObject):
         app = self._get_app()
         if app:
             AppHelper.callAfter(app._open_settings_window)
+
+    def showHelp_(self, sender):
+        """Handle Help menu click."""
+        HelpWindow.show_help()
 
     def toggleDictation_(self, sender):
         """Handle Toggle Dictation menu click."""
@@ -216,9 +308,9 @@ def setup_app_menu(handler):
     dictation_menu_item.setSubmenu_(dictation_menu)
     dictation_menu_item.setTitle_("Dictation")
 
-    # Toggle Dictation
+    # Toggle Dictation (no key equivalent - actual hotkey handled by pynput)
     toggle_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-        "Start Dictation", "toggleDictation:", "d"
+        "Start Dictation", "toggleDictation:", ""
     )
     toggle_item.setTarget_(handler)
     dictation_menu.addItem_(toggle_item)
@@ -270,6 +362,7 @@ def setup_app_menu(handler):
     help_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
         "YardTalk Help", "showHelp:", "?"
     )
+    help_item.setTarget_(handler)
     help_menu.addItem_(help_item)
 
     main_menu.addItem_(help_menu_item)
@@ -364,6 +457,9 @@ class DictationApp(rumps.App):
             on_preview=self._on_live_preview
         )
 
+        # Check and request accessibility permissions before initializing hotkey manager
+        self._check_and_request_accessibility()
+
         # Initialize hotkey manager but don't start it yet
         self.hotkey_manager = HotkeyManager(
             hotkey_str=self.hotkey_string,
@@ -388,6 +484,38 @@ class DictationApp(rumps.App):
         rumps.Timer(self._setup_app_menu, 0.5).start()
 
         # Initial menu state is set above, will be updated by ASR callback
+
+    def _check_and_request_accessibility(self):
+        """Check accessibility permissions and prompt user if needed."""
+        try:
+            from ApplicationServices import AXIsProcessTrusted
+            if not AXIsProcessTrusted():
+                print("MAIN_APP: Accessibility permissions NOT granted - prompting user")
+                # Show alert and offer to open System Settings
+                response = rumps.alert(
+                    title="Permissions Required",
+                    message="YardTalk needs two permissions for hotkeys and text insertion:\n\n"
+                            "1. Accessibility - for global hotkeys\n"
+                            "2. Input Monitoring - for keyboard detection\n\n"
+                            "Click 'Open Settings' to grant Accessibility first, then:\n"
+                            "1. Click the + button and add YardTalk\n"
+                            "2. Go to Input Monitoring and add YardTalk there too\n"
+                            "3. Restart YardTalk",
+                    ok="Open Settings",
+                    cancel="Later"
+                )
+                if response == 1:  # OK clicked
+                    import subprocess
+                    subprocess.run([
+                        "open",
+                        "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
+                    ])
+            else:
+                print("MAIN_APP: Accessibility permissions already granted")
+        except ImportError:
+            print("MAIN_APP: Could not check accessibility (API unavailable)")
+        except Exception as e:
+            print(f"MAIN_APP: Error checking accessibility: {e}")
 
     def _start_hotkey_manager(self, timer):
         """Start the hotkey manager after rumps is fully initialized"""
@@ -711,10 +839,18 @@ class DictationApp(rumps.App):
 
         if not self.dictation_active:
             print(f"MAIN_APP ({log_id}): Activation - Starting dictation logic...")
+
+            # Capture the frontmost app NOW, before we show any UI
+            from AppKit import NSWorkspace
+            workspace = NSWorkspace.sharedWorkspace()
+            self._dictation_source_app = workspace.frontmostApplication()
+            if self._dictation_source_app:
+                print(f"MAIN_APP ({log_id}): Captured source app: {self._dictation_source_app.localizedName()} ({self._dictation_source_app.bundleIdentifier()})")
+
             print(f"MAIN_APP ({log_id}): Activation - Before clearing ASR buffer.")
             self.asr_service.get_buffered_audio_and_clear() # Clear any old audio
             print(f"MAIN_APP ({log_id}): Activation - After clearing ASR buffer.")
-            
+
             self.dictation_active = True
             self._last_sound_time = time.time()  # Initialize silence timer
             self._auto_stop_pending = False
@@ -861,7 +997,8 @@ class DictationApp(rumps.App):
 
         # Keep app title stable to avoid rumps menu bar disappearing bug
         # Only change the menu item text to indicate state
-        menu_item_title = f"Start Dictation ({self.hotkey_string})"
+        display_hotkey = hotkey_to_display(self.hotkey_string)
+        menu_item_title = f"Start Dictation ({display_hotkey})"
 
         if self.asr_model_status == "initializing":
             menu_item_title = "ASR Initializing..."
@@ -872,8 +1009,15 @@ class DictationApp(rumps.App):
         elif self.dictation_active:
             menu_item_title = "Stop Dictation (Recording...)"
 
+        # Update rumps menu item
         if toggle_item and toggle_item.title != menu_item_title:
             toggle_item.title = menu_item_title
+
+        # Update native AppKit menu item (Dictation > Start/Stop Dictation)
+        if hasattr(self, '_menu_handler') and hasattr(self._menu_handler, 'toggle_menu_item'):
+            native_item = self._menu_handler.toggle_menu_item
+            if native_item and native_item.title() != menu_item_title:
+                native_item.setTitle_(menu_item_title)
 
     def _build_history_menu_items(self) -> list:
         """Build the Recent Transcriptions submenu items."""
@@ -990,22 +1134,63 @@ class DictationApp(rumps.App):
         """Called when user confirms corrected text in the correction window."""
         print(f"MAIN_APP: Correction confirmed. Original: '{original_text[:30]}...', Corrected: '{corrected_text[:30]}...'")
 
-        # Restore focus to the original app BEFORE inserting text
-        self.correction_window.restore_previous_app_focus()
+        # Use the source app captured when dictation STARTED (not when correction window opened)
+        source_app = getattr(self, '_dictation_source_app', None)
+        if source_app:
+            target_app_name = source_app.localizedName() or ""
+            bundle_id = source_app.bundleIdentifier() or ""
+            # Check if source app is likely to accept text
+            non_text_bundles = {"com.apple.finder", "com.apple.dock.extra", "com.apple.loginwindow"}
+            target_likely_text = bundle_id not in non_text_bundles and bundle_id != ""
+            print(f"MAIN_APP: Source app (from dictation start): '{target_app_name}' ({bundle_id}), likely_text_accepting: {target_likely_text}")
+        else:
+            # Fallback to correction window's captured app
+            target_app_name = self.correction_window.get_target_app_name()
+            target_likely_text = self.correction_window.is_target_likely_text_accepting()
+            print(f"MAIN_APP: Target app (fallback): '{target_app_name}', likely_text_accepting: {target_likely_text}")
+
+        # SAFETY NET: Copy to clipboard BEFORE attempting insertion
+        clipboard_success = self.correction_window.copy_to_clipboard(corrected_text)
+
+        # Restore focus to the SOURCE app (where dictation started) BEFORE inserting text
+        if source_app:
+            print(f"MAIN_APP: Restoring focus to source app: {target_app_name}")
+            source_app.activateWithOptions_(0)
+            time.sleep(0.1)  # Small delay for focus to settle
+        else:
+            self.correction_window.restore_previous_app_focus()
 
         # Add to history with both original and corrected
         self._add_to_history(original_text, corrected_text)
 
-        # Insert the corrected text
-        try:
-            insertion_result = self.text_insertion_service.insert_text(corrected_text)
-            if insertion_result:
-                rumps.notification("Transcription Complete", "Text inserted.", corrected_text[:50])
-            else:
-                rumps.notification("Insertion Failed", "Could not type text.", corrected_text[:50])
-        except Exception as e:
-            print(f"MAIN_APP: Error during text insertion: {e}")
-            rumps.notification("Insertion Error", str(e)[:50], corrected_text[:50])
+        # Insert the corrected text (skip if target won't accept it)
+        if not target_likely_text:
+            # Don't even try to type - it would just cause error beeps
+            print(f"MAIN_APP: Skipping keyboard insertion - target not text-accepting")
+            # Show toast notification using AppKit (more reliable than rumps)
+            show_toast("Text Copied", "Press Cmd+V to paste")
+        else:
+            try:
+                insertion_result = self.text_insertion_service.insert_text(corrected_text)
+                print(f"MAIN_APP: insert_text returned: {insertion_result}")
+
+                if insertion_result:
+                    msg = f"Text inserted into {target_app_name}." if target_app_name else "Text inserted."
+                    rumps.notification("Transcription Complete", msg, corrected_text[:50])
+                else:
+                    if clipboard_success:
+                        rumps.notification("Insertion Failed",
+                            "Text copied to clipboard. Press Cmd+V to paste.", corrected_text[:50])
+                    else:
+                        rumps.notification("Insertion Failed",
+                            "Could not insert or copy text.", corrected_text[:50])
+            except Exception as e:
+                print(f"MAIN_APP: Error during text insertion: {e}")
+                if clipboard_success:
+                    rumps.notification("Insertion Error",
+                        "Text copied to clipboard. Press Cmd+V to paste.", corrected_text[:50])
+                else:
+                    rumps.notification("Insertion Error", str(e)[:50], corrected_text[:50])
 
         self._last_transcribed_text = corrected_text
         self._pending_transcription_text = None  # Clear pending text

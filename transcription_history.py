@@ -31,22 +31,46 @@ class TranscriptionEntry:
             and self.corrected_text != self.original_text
         )
 
-    def menu_title(self, max_length: int = 40) -> str:
+    def menu_title(self, max_length: int = 45) -> str:
         """Formatted string for menu display."""
-        text = self.display_text.replace("\n", " ")
-        if len(text) > max_length:
-            text = text[: max_length - 3] + "..."
-        time_str = self.timestamp.strftime("%H:%M")
+        text = self.display_text.replace("\n", " ").strip()
 
-        # Indicators: * = edited, X = discarded
+        # Calculate available space for text (leaving room for time and indicators)
+        time_str = self._relative_time()
+        suffix_parts = [time_str]
+
         if self.discarded:
-            prefix = "X "
+            suffix_parts.append("discarded")
         elif self.was_corrected:
-            prefix = "* "
-        else:
-            prefix = ""
+            suffix_parts.append("edited")
 
-        return f"{prefix}[{time_str}] {text}"
+        suffix = " · ".join(suffix_parts)
+        available = max_length - len(suffix) - 3  # 3 for " · " separator
+
+        if len(text) > available:
+            text = text[: available - 1] + "…"
+
+        return f"{text} · {suffix}"
+
+    def _relative_time(self) -> str:
+        """Return human-friendly relative time string."""
+        from datetime import datetime
+
+        now = datetime.now()
+        delta = now - self.timestamp
+        seconds = int(delta.total_seconds())
+
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            mins = seconds // 60
+            return f"{mins}m ago"
+        elif seconds < 86400:
+            hours = seconds // 3600
+            return f"{hours}h ago"
+        else:
+            # Fall back to date for older entries
+            return self.timestamp.strftime("%b %d")
 
 
 class TranscriptionHistory:

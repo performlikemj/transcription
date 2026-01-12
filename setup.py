@@ -126,7 +126,9 @@ PY2APP_OPTS = dict(
         "LSUIElement":                False,  # Dock app (shows in Dock)
         "NSMainNibFile":              "",    # No nib - rumps creates UI programmatically
         "NSMicrophoneUsageDescription":
-            "Speech to text for YardTalk",
+            "YardTalk needs microphone access to capture your speech for transcription.",
+        "NSAccessibilityUsageDescription":
+            "YardTalk needs accessibility access for global hotkeys and to type transcribed text into other applications.",
     },
 )
 
