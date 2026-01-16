@@ -25,7 +25,7 @@ print = log_print
 SHUTDOWN_SENTINEL = object()
 
 class ASRService:
-    def __init__(self, model_path="parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo", result_callback=None):
+    def __init__(self, model_path=None, result_callback=None):
         self.model_path = model_path
         self.asr_model = None
         self.device = None
@@ -42,10 +42,11 @@ class ASRService:
     def _initialize_model_on_worker(self):
         # This method is called by the ASR worker thread
         print("ASR_SERVICE (worker): Initializing ASR model...")
-        if not os.path.exists(self.model_path):
-            print(f"ASR_SERVICE (worker): ERROR - Model file not found at {self.model_path}")
+        if not self.model_path or not os.path.exists(self.model_path):
+            error_msg = "No model path specified" if not self.model_path else f"Model file not found: {self.model_path}"
+            print(f"ASR_SERVICE (worker): ERROR - {error_msg}")
             if self.result_callback:
-                self.result_callback(None, FileNotFoundError(f"Model file not found: {self.model_path}"))
+                self.result_callback(None, FileNotFoundError(error_msg))
             return False
 
         if torch.backends.mps.is_available() and torch.backends.mps.is_built():

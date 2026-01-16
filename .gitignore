@@ -22,4 +22,4 @@ dist/
 .vscode/
 
 # Model files (too large for git)
-parakeet-tdt-0.6b-v2/
+parakeet-tdt-*/

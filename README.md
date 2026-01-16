@@ -43,22 +43,18 @@ A macOS dictation app powered by NVIDIA's Parakeet ASR model. Speak naturally an
 
 4. **Download the Parakeet ASR model:**
 
-   The app uses NVIDIA's Parakeet TDT 0.6B v2 model. Download it from HuggingFace:
+   The app uses NVIDIA's Parakeet TDT model. Download from HuggingFace:
 
    ```bash
-   # Create model directory
-   mkdir -p parakeet-tdt-0.6b-v2
-
    # Download using huggingface-cli (install with: pip install huggingface_hub)
-   huggingface-cli download nvidia/parakeet-tdt-0.6b \
-     --local-dir parakeet-tdt-0.6b-v2 \
+   huggingface-cli download nvidia/parakeet-tdt-0.6b-v3 \
+     --local-dir parakeet-tdt-0.6b-v3 \
      --include "*.nemo"
    ```
 
-   Alternatively, download manually:
-   - Visit https://huggingface.co/nvidia/parakeet-tdt-0.6b
-   - Download the `.nemo` file
-   - Place it at: `parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo`
+   Or download manually from https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3/tree/main
+
+   The app automatically detects any `parakeet-tdt-*` directory in the project root, so newer model versions work without code changes.
 
 5. **Run the app:**
    ```bash

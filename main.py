@@ -379,6 +379,35 @@ def setup_app_menu(handler):
     return True
 
 
+def find_parakeet_model(search_dir):
+    """
+    Find a Parakeet TDT model in the given directory.
+    Searches for directories matching 'parakeet-tdt-*' and returns the path
+    to the .nemo file inside. Supports any version (v2, v3, etc).
+
+    Returns the path to the .nemo file, or None if not found.
+    """
+    import glob
+    search_path = pathlib.Path(search_dir)
+
+    # Look for parakeet-tdt-* directories
+    model_dirs = sorted(search_path.glob("parakeet-tdt-*"), reverse=True)
+
+    for model_dir in model_dirs:
+        if model_dir.is_dir():
+            # Find .nemo file inside
+            nemo_files = list(model_dir.glob("*.nemo"))
+            if nemo_files:
+                return str(nemo_files[0])
+
+    # Also check for .nemo files directly in the search directory (for bundled app)
+    direct_nemo = sorted(search_path.glob("parakeet-tdt-*.nemo"), reverse=True)
+    if direct_nemo:
+        return str(direct_nemo[0])
+
+    return None
+
+
 # Used to distinguish ASR service callbacks
 ASR_CALLBACK_TYPE_MODEL_LOAD = "model_load_status"
 ASR_CALLBACK_TYPE_TRANSCRIPTION = "transcription_result"
@@ -437,16 +466,19 @@ class DictationApp(rumps.App):
 
         # Determine model path based on whether we're running from a bundle or source
         if getattr(sys, "frozen", False):
-            # Running inside YardTalk.app
+            # Running inside YardTalk.app - model is in Resources
             bundle_root = pathlib.Path(sys.executable).resolve().parents[1]  # .../Contents
-            # Model is placed directly in Resources (not in a subdirectory)
-            model_path = bundle_root / "Resources" / "parakeet-tdt-0.6b-v2.nemo"
-            model_path = str(model_path)
+            resources_dir = bundle_root / "Resources"
+            model_path = find_parakeet_model(resources_dir)
         else:
-            # Running from source (model is in a subdirectory)
-            model_path = "parakeet-tdt-0.6b-v2/parakeet-tdt-0.6b-v2.nemo"
-        
-        print(f"MAIN_APP: Using model path: {model_path}")
+            # Running from source - search current directory for parakeet-tdt-* folder
+            model_path = find_parakeet_model(".")
+
+        if not model_path:
+            print("MAIN_APP: ERROR - No Parakeet model found! Please download a parakeet-tdt model.")
+            model_path = None  # Will trigger error in ASRService
+        else:
+            print(f"MAIN_APP: Using model path: {model_path}")
         self.asr_service = ASRService(model_path=model_path, result_callback=self._handle_asr_service_result)
 
         # Initialize live transcription service for preview during recording

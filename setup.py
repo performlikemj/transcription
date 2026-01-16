@@ -10,8 +10,34 @@ from setuptools import setup
 APP_NAME = "YardTalk"
 APP      = ["main.py"]
 ICON     = "icon.icns"
-MODEL_DIR = "parakeet-tdt-0.6b-v2"  # Include the entire directory
-MODEL_FILE = f"{MODEL_DIR}/parakeet-tdt-0.6b-v2.nemo"
+
+
+def find_parakeet_model():
+    """
+    Find the Parakeet TDT model directory and .nemo file.
+    Supports any version (v2, v3, etc.) by searching for parakeet-tdt-* directories.
+    Returns (model_dir, model_file) or (None, None) if not found.
+    """
+    import glob
+    # Look for parakeet-tdt-* directories, sorted in reverse to prefer newer versions
+    model_dirs = sorted(pathlib.Path(".").glob("parakeet-tdt-*"), reverse=True)
+
+    for model_dir in model_dirs:
+        if model_dir.is_dir():
+            nemo_files = list(model_dir.glob("*.nemo"))
+            if nemo_files:
+                return str(model_dir), str(nemo_files[0])
+
+    return None, None
+
+
+# Find the model dynamically - supports any parakeet-tdt version
+MODEL_DIR, MODEL_FILE = find_parakeet_model()
+if MODEL_DIR is None:
+    print("⚠️  Warning: No parakeet-tdt-* model directory found!")
+    print("   Please download a Parakeet model before building.")
+    MODEL_DIR = "parakeet-tdt-model"  # Placeholder
+    MODEL_FILE = ""
 
 def _patch_torio_docstring_issue():
     """
@@ -205,22 +231,20 @@ def _fix_torchaudio(plat_app):
 
     # Ensure the model is in the correct location
     app_resources = pathlib.Path(plat_app) / "Contents/Resources"
-    model_dest_dir = app_resources / MODEL_DIR
-    model_dest_file = model_dest_dir / "parakeet-tdt-0.6b-v2.nemo"
+    source_model = pathlib.Path(MODEL_FILE) if MODEL_FILE else None
 
-    # Create the model directory if it doesn't exist
-    model_dest_dir.mkdir(exist_ok=True)
-
-    # Copy the model file if it's not already there or in the wrong place
-    source_model = pathlib.Path(MODEL_FILE)
-    if source_model.exists() and not model_dest_file.exists():
-        print(f"Copying model from {source_model} to {model_dest_file}")
-        shutil.copy2(str(source_model), str(model_dest_file))
-        print(f"✓ Model copied to correct location")
-    elif model_dest_file.exists():
-        print(f"✓ Model already exists at {model_dest_file}")
+    # Copy the .nemo file directly to Resources (not in a subdirectory)
+    # This matches how find_parakeet_model() searches in main.py
+    if source_model and source_model.exists():
+        model_dest_file = app_resources / source_model.name
+        if not model_dest_file.exists():
+            print(f"Copying model from {source_model} to {model_dest_file}")
+            shutil.copy2(str(source_model), str(model_dest_file))
+            print(f"✓ Model copied to correct location")
+        else:
+            print(f"✓ Model already exists at {model_dest_file}")
     else:
-        print(f"⚠️  Warning: Could not find source model at {source_model}")
+        print(f"⚠️  Warning: Could not find source model at {MODEL_FILE}")
 
     # Fix torio rpaths first (before torchaudio since torchaudio may depend on it)
     _fix_torio_rpaths(plat_app)
