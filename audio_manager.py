@@ -31,13 +31,86 @@ class AudioManager:
         self.audio_chunk_callback = None
         self.lock = threading.Lock() # Lock for synchronizing access to shared state like _is_recording
 
+        # Pre-warming state
+        self._is_prewarmed = False
+        self._prewarm_error = None
+
+    @property
+    def is_prewarmed(self):
+        """Check if audio subsystem has been pre-warmed."""
+        return self._is_prewarmed
+
+    @property
+    def prewarm_error(self):
+        """Get the error from pre-warming, if any."""
+        return self._prewarm_error
+
+    def prewarm_audio(self, callback=None, caller_context="prewarm"):
+        """
+        Pre-warm PortAudio subsystem in a background thread.
+        This should be called at app startup to avoid delays on first recording.
+
+        Args:
+            callback: Optional callback(success: bool, error: Exception|None) called when complete
+            caller_context: Debug context string
+
+        Returns:
+            The background thread (can be joined if needed)
+        """
+        def _prewarm_thread():
+            try:
+                print(f"AUDIO_MANAGER ({caller_context}): Pre-warming PortAudio...")
+                sd._terminate()
+                sd._initialize()
+
+                # Query devices to force enumeration
+                try:
+                    default_device = sd.query_devices(kind='input')
+                    print(f"AUDIO_MANAGER ({caller_context}): Default input device: {default_device['name']}")
+                except Exception as e:
+                    print(f"AUDIO_MANAGER ({caller_context}): Could not query default device during prewarm: {e}")
+
+                # Open a brief test stream to trigger full driver initialization
+                print(f"AUDIO_MANAGER ({caller_context}): Opening test stream for prewarm...")
+                with sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=self.channels,
+                    dtype=self.dtype,
+                    blocksize=self.chunk_size,
+                ) as test_stream:
+                    # Read a small amount to ensure stream is fully initialized
+                    test_stream.read(self.chunk_size)
+
+                self._is_prewarmed = True
+                self._prewarm_error = None
+                print(f"AUDIO_MANAGER ({caller_context}): Pre-warm successful")
+                if callback:
+                    callback(True, None)
+            except Exception as e:
+                self._prewarm_error = e
+                self._is_prewarmed = False
+                print(f"AUDIO_MANAGER ({caller_context}): Pre-warm failed: {e}")
+                if callback:
+                    callback(False, e)
+
+        thread = threading.Thread(target=_prewarm_thread, daemon=True)
+        thread.start()
+        return thread
+
     def _recording_loop(self, caller_context="unknown_loop_start"):
         print(f"AUDIO_MANAGER ({caller_context}): Recording loop thread started.")
         stream = None
         try:
-            # IMPORTANT: Refresh device cache to detect newly connected devices
-            sd._terminate()
-            sd._initialize()
+            # Only refresh device cache if NOT prewarmed recently
+            # This avoids slow initialization on first recording after app startup
+            if not self._is_prewarmed:
+                print(f"AUDIO_MANAGER ({caller_context}): Refreshing device cache (not prewarmed)...")
+                sd._terminate()
+                sd._initialize()
+            else:
+                print(f"AUDIO_MANAGER ({caller_context}): Skipping device refresh (already prewarmed)")
+                # Reset prewarm flag so next recording can detect hot-plugged devices
+                self._is_prewarmed = False
 
             # Log default input device after refresh
             try:
@@ -133,8 +206,8 @@ class AudioManager:
             self._recording_thread.start()
             print(f"AUDIO_MANAGER ({caller_context}): Recording session initiated (thread started).")
 
-        if not self._stream_ready_event.wait(timeout=2.0):
-            print(f"AUDIO_MANAGER ({caller_context}): Timed out waiting for audio stream to initialize.")
+        if not self._stream_ready_event.wait(timeout=5.0):
+            print(f"AUDIO_MANAGER ({caller_context}): Timed out waiting for audio stream to initialize (5s timeout).")
             self._recording_active_event.clear()
             with self.lock:
                 self._is_recording = False

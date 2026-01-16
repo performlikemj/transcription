@@ -452,8 +452,10 @@ class DictationApp(rumps.App):
         self._waiting_for_correction = False  # True while correction window is open
 
         self.asr_model_status = "initializing" # "initializing", "loaded", "error"
+        self.audio_subsystem_status = "initializing"  # "initializing", "ready", "error"
         # Flag to ensure MODEL_LOADED_SUCCESSFULLY is handled only once
         self._model_loaded_handled = False
+        self._hotkeys_started = False  # Track whether hotkeys have been started
         self.active_timers = [] # Add a list to keep track of active timers
         self._last_transcribed_text = None  # Remember the last text we actually typed
         self.update_menu_state()
@@ -463,6 +465,13 @@ class DictationApp(rumps.App):
         self.audio_manager = AudioManager()
         self.text_insertion_service = TextInsertionService()
         self.overlay_window = OverlayWindow()
+
+        # Pre-warm audio subsystem in background to avoid first-recording delays
+        print("MAIN_APP: Starting audio subsystem pre-warm...")
+        self.audio_manager.prewarm_audio(
+            callback=self._on_audio_prewarm_complete,
+            caller_context="app_init"
+        )
 
         # Determine model path based on whether we're running from a bundle or source
         if getattr(sys, "frozen", False):
@@ -499,9 +508,11 @@ class DictationApp(rumps.App):
             on_deactivate=self.request_deactivate_dictation
         )
         
-        # Start hotkey manager after a short delay to ensure rumps is fully initialized
-        print("MAIN_APP: Scheduling hotkey manager startup...")
-        rumps.Timer(self._start_hotkey_manager, 1.0).start()
+        # Start hotkey manager only when both ASR and audio subsystems are ready
+        # Use a polling timer that checks readiness every 0.5 seconds
+        print("MAIN_APP: Scheduling hotkey manager startup (waiting for subsystems)...")
+        self._startup_check_timer = rumps.Timer(self._check_readiness_and_start_hotkeys, 0.5)
+        self._startup_check_timer.start()
 
         # Set up global settings shortcut (Cmd+,)
         global _app_instance
@@ -549,18 +560,63 @@ class DictationApp(rumps.App):
         except Exception as e:
             print(f"MAIN_APP: Error checking accessibility: {e}")
 
-    def _start_hotkey_manager(self, timer):
-        """Start the hotkey manager after rumps is fully initialized"""
+    def _on_audio_prewarm_complete(self, success, error):
+        """Callback when audio pre-warming completes (called from background thread)."""
+        from PyObjCTools import AppHelper
+
+        def _update_status():
+            if success:
+                self.audio_subsystem_status = "ready"
+                print("MAIN_APP: Audio subsystem ready")
+            else:
+                self.audio_subsystem_status = "error"
+                print(f"MAIN_APP: Audio subsystem error: {error}")
+            self.update_menu_state()
+
+        AppHelper.callAfter(_update_status)
+
+    def _check_readiness_and_start_hotkeys(self, timer):
+        """Check if both subsystems are ready and start hotkeys if so."""
+        # Don't start twice
+        if self._hotkeys_started:
+            timer.stop()
+            return
+
+        # Check if both subsystems are ready (or one has errored but we should still allow hotkeys)
+        asr_ready = self.asr_model_status == "loaded"
+        audio_ready = self.audio_subsystem_status == "ready"
+
+        # Log current status periodically
+        print(f"MAIN_APP: Readiness check - ASR: {self.asr_model_status}, Audio: {self.audio_subsystem_status}")
+
+        if asr_ready and audio_ready:
+            timer.stop()
+            self._hotkeys_started = True
+            print("MAIN_APP: Both subsystems ready, starting hotkey manager")
+            self._start_hotkey_manager_internal()
+        elif self.asr_model_status == "error" or self.audio_subsystem_status == "error":
+            # One subsystem errored - still start hotkeys but user will see error when they try to use it
+            timer.stop()
+            self._hotkeys_started = True
+            print("MAIN_APP: Subsystem error detected, starting hotkeys anyway (user will see error on use)")
+            self._start_hotkey_manager_internal()
+
+    def _start_hotkey_manager_internal(self):
+        """Internal method to start the hotkey manager."""
         print("MAIN_APP: Starting hotkey manager...")
         try:
             self.hotkey_manager.start_listening()
+            display_hotkey = hotkey_to_display(self.hotkey_string)
             print(f"MAIN_APP: Hotkey manager started successfully for {self.hotkey_string}")
-            rumps.notification("Dictation App", "Hotkeys Active", f"Press {self.hotkey_string} to start dictation")
+            rumps.notification("YardTalk Ready", "Dictation available", f"Press {display_hotkey} to start dictation")
         except Exception as e:
             print(f"MAIN_APP: Failed to start hotkey manager: {e}")
             rumps.alert("Hotkey Error", f"Failed to start hotkey listener: {e}")
-        finally:
-            timer.stop()  # Make this a one-shot timer
+
+    def _start_hotkey_manager(self, timer):
+        """Start the hotkey manager after rumps is fully initialized (legacy, kept for compatibility)"""
+        self._start_hotkey_manager_internal()
+        timer.stop()  # Make this a one-shot timer
 
     def _setup_app_menu(self, timer):
         """Add Settings to the application menu after rumps is initialized"""
@@ -854,16 +910,34 @@ class DictationApp(rumps.App):
             print(f"MAIN_APP ({log_id}): Mic busy, returning.")
             return
 
-        print(f"MAIN_APP ({log_id}): State pre-activation: asr_model_status='{self.asr_model_status}', is_transcribing={self.is_transcribing}, dictation_active={self.dictation_active}")
+        print(f"MAIN_APP ({log_id}): State pre-activation: asr_model_status='{self.asr_model_status}', audio_status='{self.audio_subsystem_status}', is_transcribing={self.is_transcribing}, dictation_active={self.dictation_active}")
 
+        # Check audio subsystem status first
+        if self.audio_subsystem_status == "initializing":
+            rumps.notification("Initializing", "Audio system warming up...", "Please try again in a moment.")
+            if self.hotkey_manager.hotkey_active:
+                self.hotkey_manager.hotkey_active = False
+            print(f"MAIN_APP ({log_id}): Audio initializing, returning.")
+            return
+        if self.audio_subsystem_status == "error":
+            error_msg = str(self.audio_manager.prewarm_error) if self.audio_manager.prewarm_error else "Unknown error"
+            rumps.alert("Audio Error", f"Audio system failed to initialize:\n{error_msg}\n\nCheck System Settings > Privacy & Security > Microphone.")
+            if self.hotkey_manager.hotkey_active:
+                self.hotkey_manager.hotkey_active = False
+            print(f"MAIN_APP ({log_id}): Audio error, returning.")
+            return
+
+        # Check ASR model status
         if self.asr_model_status == "initializing":
-            rumps.notification("ASR Not Ready", "Model is still initializing.", "Please wait.")
-            if self.hotkey_manager.hotkey_active: self.hotkey_manager.hotkey_active = False
+            rumps.notification("Initializing", "ASR model is loading...", "Please try again in a moment.")
+            if self.hotkey_manager.hotkey_active:
+                self.hotkey_manager.hotkey_active = False
             print(f"MAIN_APP ({log_id}): ASR initializing, returning.")
             return
         if self.asr_model_status == "error":
             rumps.alert("ASR Error", "ASR model failed to load. Cannot start dictation.")
-            if self.hotkey_manager.hotkey_active: self.hotkey_manager.hotkey_active = False
+            if self.hotkey_manager.hotkey_active:
+                self.hotkey_manager.hotkey_active = False
             return
         if self.is_transcribing:
             print(f"MAIN_APP ({log_id}): Already transcribing, returning.")
@@ -1032,10 +1106,20 @@ class DictationApp(rumps.App):
         display_hotkey = hotkey_to_display(self.hotkey_string)
         menu_item_title = f"Start Dictation ({display_hotkey})"
 
-        if self.asr_model_status == "initializing":
-            menu_item_title = "ASR Initializing..."
+        # Determine menu state based on BOTH subsystems
+        asr_initializing = self.asr_model_status == "initializing"
+        audio_initializing = self.audio_subsystem_status == "initializing"
+
+        if asr_initializing and audio_initializing:
+            menu_item_title = "Initializing..."
+        elif asr_initializing:
+            menu_item_title = "Loading ASR Model..."
+        elif audio_initializing:
+            menu_item_title = "Initializing Audio..."
         elif self.asr_model_status == "error":
             menu_item_title = "ASR Model Failed"
+        elif self.audio_subsystem_status == "error":
+            menu_item_title = "Audio System Failed"
         elif self.is_transcribing:
             menu_item_title = "Processing..."
         elif self.dictation_active:

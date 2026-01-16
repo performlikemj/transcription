@@ -356,21 +356,22 @@ def _fix_torchaudio(plat_app):
     # remove Finder metadata that can break codesign
     subprocess.run(["xattr", "-cr", str(plat_app)], check=False)
     
-    # Re-sign the top-level bundle
+    # Re-sign the entire bundle with --deep to ensure all nested components are signed
     try:
         check_call(
             [
                 "codesign",
                 "--force",
+                "--deep",
                 "-s",
                 "-",
                 "--timestamp=none",
                 str(plat_app),
             ]
         )
-        print("✓ Successfully signed the app bundle")
+        print("✓ Successfully signed the app bundle (deep)")
     except Exception as e:
-        print("⚠️  Warning: shallow codesign of bundle failed – continuing:", e)
+        print("⚠️  Warning: deep codesign of bundle failed – continuing:", e)
 
 
 def _copy_pkg_resources_deps(plat_app):
