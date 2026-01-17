@@ -93,8 +93,9 @@ YardTalk requires **three** system permissions to function properly:
 - **Grant in**: System Settings > Privacy & Security > Accessibility > Add YardTalk
 
 ### 3. Input Monitoring
-- **Why**: To detect global hotkey presses (required by pynput)
+- **Why**: To detect global hotkey presses (may be required depending on macOS version)
 - **Grant in**: System Settings > Privacy & Security > Input Monitoring > Add YardTalk
+- **Note**: The bundled app uses native macOS event monitoring which may work without this permission, but grant it if hotkeys don't respond
 
 **Important**: After granting Accessibility and Input Monitoring permissions:
 1. Toggle each permission OFF and then ON again
@@ -177,12 +178,12 @@ The ASR model takes 10-30 seconds to load on first launch. If it doesn't complet
 
 ```
 main.py (DictationApp)
-├── HotkeyManager       - Global hotkey detection via pynput
+├── HotkeyManager       - Global hotkey detection (native NSEvent in app, pynput in dev)
 ├── AudioManager        - Microphone capture via sounddevice (threaded)
 ├── ASRService          - Speech recognition via NeMo (worker thread)
 ├── TextInsertionService - Keyboard input simulation via pynput
 ├── OverlayWindow       - Native macOS floating waveform (PyObjC/AppKit)
-├── CorrectionWindow    - Text review/editing before insertion
+├── CorrectionWindow    - Text review/editing with timestamp display
 ├── SettingsManager     - Persistent settings via NSUserDefaults
 └── PreferencesWindow   - Settings UI for hotkey configuration
 ```
@@ -201,10 +202,11 @@ pytest
 - `main.py` - Main application and rumps integration
 - `audio_manager.py` - Audio capture using sounddevice
 - `asr_service.py` - ASR processing with NVIDIA NeMo/Parakeet
+- `transcription_result.py` - Transcription data with word/segment timestamps
 - `text_insertion_service.py` - Text typing via pynput
 - `overlay_window.py` - Native macOS floating waveform display
-- `correction_window.py` - Text review/editing window
-- `hotkey_manager.py` - Global hotkey handling via pynput
+- `correction_window.py` - Text review/editing window with timestamp view
+- `hotkey_manager.py` - Global hotkey handling (native NSEvent / pynput)
 - `settings_manager.py` - UserDefaults-based settings persistence
 - `preferences_window.py` - Settings UI
 - `transcription_history.py` - Recent transcriptions management
@@ -224,5 +226,5 @@ MIT License
 
 - [NVIDIA NeMo](https://github.com/NVIDIA/NeMo) for the Parakeet ASR model
 - [rumps](https://github.com/jaredks/rumps) for macOS menu bar integration
-- [PyObjC](https://pyobjc.readthedocs.io/) for native macOS window support
-- [pynput](https://github.com/moses-palmer/pynput) for global hotkey detection
+- [PyObjC](https://pyobjc.readthedocs.io/) for native macOS window and event support
+- [pynput](https://github.com/moses-palmer/pynput) for keyboard input simulation
