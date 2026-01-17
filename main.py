@@ -71,6 +71,7 @@ from preferences_window import PreferencesWindow, hotkey_to_display
 from transcription_history import TranscriptionHistory
 from correction_window import CorrectionWindow
 from live_transcription_service import LiveTranscriptionService
+from transcription_result import TranscriptionResult
 from help_window import HelpWindow
 import sounddevice as sd
 from PyObjCTools import AppHelper
@@ -638,6 +639,65 @@ class DictationApp(rumps.App):
 
     def _setup_settings_shortcut(self):
         """Set up Cmd+, global shortcut to open Settings."""
+        import sys as _sys
+
+        # Check if running as bundled app
+        is_bundled = getattr(_sys, "frozen", False) and _sys.platform == "darwin"
+
+        if is_bundled:
+            # Use native NSEvent monitoring for bundled apps
+            self._setup_settings_shortcut_native()
+        else:
+            # Use pynput for development mode
+            self._setup_settings_shortcut_pynput()
+
+    def _setup_settings_shortcut_native(self):
+        """Set up Cmd+, shortcut using native macOS NSEvent monitoring."""
+        try:
+            from Quartz import (
+                NSEvent,
+                NSEventMaskKeyDown,
+                NSEventTypeKeyDown,
+            )
+
+            # macOS key code for comma is 43
+            COMMA_KEY_CODE = 43
+            # Modifier flag for Command key
+            NSEventModifierFlagCommand = 1 << 20
+
+            def handle_settings_event(event):
+                try:
+                    if event.type() == NSEventTypeKeyDown:
+                        key_code = event.keyCode()
+                        flags = event.modifierFlags()
+
+                        # Check for Cmd+, (comma with command modifier)
+                        cmd_down = bool(flags & NSEventModifierFlagCommand)
+                        if key_code == COMMA_KEY_CODE and cmd_down:
+                            print("MAIN_APP: Settings shortcut (Cmd+,) detected via native event!")
+                            AppHelper.callAfter(self._open_settings_window)
+                except Exception as e:
+                    print(f"MAIN_APP: Error in settings event handler: {e}")
+
+            self._settings_native_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+                NSEventMaskKeyDown,
+                handle_settings_event
+            )
+
+            if self._settings_native_monitor:
+                print("MAIN_APP: Settings shortcut (Cmd+,) native monitor started")
+            else:
+                print("MAIN_APP: WARNING - Settings native monitor returned None")
+        except ImportError as e:
+            print(f"MAIN_APP: Quartz import failed for settings shortcut: {e}")
+            # Fall back to pynput
+            self._setup_settings_shortcut_pynput()
+        except Exception as e:
+            print(f"MAIN_APP: Failed to setup native settings shortcut: {e}")
+            self._setup_settings_shortcut_pynput()
+
+    def _setup_settings_shortcut_pynput(self):
+        """Set up Cmd+, shortcut using pynput (for development mode)."""
         from pynput import keyboard
 
         def on_key_press(key):
@@ -670,7 +730,28 @@ class DictationApp(rumps.App):
             on_release=on_key_release
         )
         self._settings_listener.start()
-        print("MAIN_APP: Settings shortcut (Cmd+,) listener started")
+        print("MAIN_APP: Settings shortcut (Cmd+,) pynput listener started")
+
+    def _stop_settings_shortcut(self):
+        """Stop the settings shortcut listener/monitor."""
+        # Stop native monitor if active
+        if hasattr(self, '_settings_native_monitor') and self._settings_native_monitor:
+            print("MAIN_APP: Stopping settings native monitor")
+            try:
+                from Quartz import NSEvent
+                NSEvent.removeMonitor_(self._settings_native_monitor)
+            except Exception as e:
+                print(f"MAIN_APP: Error stopping settings native monitor: {e}")
+            self._settings_native_monitor = None
+
+        # Stop pynput listener if active
+        if hasattr(self, '_settings_listener') and self._settings_listener:
+            print("MAIN_APP: Stopping settings pynput listener")
+            try:
+                self._settings_listener.stop()
+            except Exception as e:
+                print(f"MAIN_APP: Error stopping settings pynput listener: {e}")
+            self._settings_listener = None
 
     def _process_audio_chunk(self, chunk):
         self.asr_service.process_audio_chunk(chunk)
@@ -750,32 +831,47 @@ class DictationApp(rumps.App):
     def _handle_asr_service_result(self, result_payload, error_payload):
         # Generate a log ID for this specific ASR result handling sequence
         asr_result_log_id = f"asr_res_{time.monotonic()}"
-        print(f"MAIN_APP ({asr_result_log_id}): _handle_asr_service_result ENTERED. Result: '{str(result_payload)[:50]}...', Error: {error_payload}")
+
+        # Extract text for logging (handle both strings and TranscriptionResult)
+        if isinstance(result_payload, TranscriptionResult):
+            log_text = result_payload.text[:50] if result_payload.text else ""
+        elif isinstance(result_payload, str):
+            log_text = result_payload[:50]
+        else:
+            log_text = str(result_payload)[:50]
+
+        print(f"MAIN_APP ({asr_result_log_id}): _handle_asr_service_result ENTERED. Result: '{log_text}...', Error: {error_payload}")
 
         if result_payload == "MODEL_LOADED_SUCCESSFULLY" and self._model_loaded_handled:
             print(f"MAIN_APP ({asr_result_log_id}): Duplicate MODEL_LOADED_SUCCESSFULLY received, ignoring.")
             return
-        
-        callback_type = ASR_CALLBACK_TYPE_TRANSCRIPTION 
-        data_to_pass = {'text': result_payload, 'error': error_payload}
+
+        callback_type = ASR_CALLBACK_TYPE_TRANSCRIPTION
+        data_to_pass = {'result': result_payload, 'error': error_payload}
 
         if result_payload == "MODEL_LOADED_SUCCESSFULLY":
             callback_type = ASR_CALLBACK_TYPE_MODEL_LOAD
             data_to_pass = {'status': "loaded", 'error': None}
             self._model_loaded_handled = True
             print(f"MAIN_APP ({asr_result_log_id}): Processed as MODEL_LOADED_SUCCESSFULLY.")
-        elif error_payload and self.asr_model_status == "initializing": 
+        elif error_payload and self.asr_model_status == "initializing":
             callback_type = ASR_CALLBACK_TYPE_MODEL_LOAD
             data_to_pass = {'status': "error", 'error': error_payload}
             print(f"MAIN_APP ({asr_result_log_id}): Processed as MODEL_LOAD error during init.")
         elif callback_type == ASR_CALLBACK_TYPE_TRANSCRIPTION:
-            # Fix 2: Don't even create a timer for blank results
-            if error_payload is None and (
-                result_payload is None
-                or (isinstance(result_payload, str) and result_payload.strip() == "")
-            ):
+            # Check for blank results - handle both TranscriptionResult and string
+            is_blank = False
+            if error_payload is None:
+                if result_payload is None:
+                    is_blank = True
+                elif isinstance(result_payload, TranscriptionResult):
+                    is_blank = not result_payload.text.strip()
+                elif isinstance(result_payload, str):
+                    is_blank = not result_payload.strip()
+
+            if is_blank:
                 print(f"MAIN_APP ({asr_result_log_id}): Empty or blank transcription received from ASRService. Skipping timer creation.")
-                # Explicitly set is_transcribing to False here if appropriate, 
+                # Explicitly set is_transcribing to False here if appropriate,
                 # as _process_asr_result_on_main_thread won't be called to do it.
                 if self.is_transcribing: # Only if we were actually waiting for a transcription
                     self.is_transcribing = False
@@ -786,9 +882,9 @@ class DictationApp(rumps.App):
                         self.hotkey_manager.hotkey_active = False
                     self.update_menu_state()
                 return
-        
+
         timer_payload_for_main_thread = {'type': callback_type, 'data': data_to_pass}
-        
+
         # Pass the asr_result_log_id to be used by _create_timer_on_main
         payload_with_context = timer_payload_for_main_thread.copy() # Avoid modifying original dict if it's used elsewhere
         payload_with_context['log_id_for_timer'] = asr_result_log_id
@@ -817,7 +913,7 @@ class DictationApp(rumps.App):
                     rumps.alert("ASR Model Error", f"Failed to load ASR model: {str(error)}. Transcription will not be available.")
             
             elif callback_type == ASR_CALLBACK_TYPE_TRANSCRIPTION:
-                transcribed_text = data['text']
+                transcription_result = data['result']
                 error_obj = data['error'] # Renamed to avoid conflict with 'error' in MODEL_LOAD
 
                 # Existing handling for actual transcription results
@@ -825,25 +921,41 @@ class DictationApp(rumps.App):
                     if error_obj:
                         rumps.alert("Transcription Failed", f"Could not transcribe audio: {str(error_obj)}")
                         return
+
+                    # Handle both TranscriptionResult and plain strings (backwards compat)
+                    if isinstance(transcription_result, TranscriptionResult):
+                        transcribed_text = transcription_result.text
+                    elif isinstance(transcription_result, str):
+                        transcribed_text = transcription_result
+                        # Wrap string in TranscriptionResult for consistency
+                        transcription_result = TranscriptionResult.from_text_only(transcribed_text)
+                    else:
+                        transcribed_text = str(transcription_result) if transcription_result else ""
+                        transcription_result = TranscriptionResult.from_text_only(transcribed_text)
+
                     # Fix 1 (part 1): Bail out early on empty text
                     # This check is now also in _handle_asr_service_result, but good to have defensively here too.
-                    if transcribed_text is None or (isinstance(transcribed_text, str) and transcribed_text.strip() == ""):
+                    if not transcribed_text or not transcribed_text.strip():
                         print(f"MAIN_APP ({log_id}): Transcription result is None or blank. Bailing out early from processing.")
                         # No notification for blank text here, as it's handled by _handle_asr_service_result or if it slips through.
                         return # Return directly from here. The finally block will still execute.
-                    elif transcribed_text is not None: # We already checked for blank, so this means non-blank
-                        if transcribed_text == self._last_transcribed_text:
-                            pass
-                        else:
-                            print("--- Transcribed Text ---")
-                            print(transcribed_text)
-                            print("------------------------")
-                            # Show correction window instead of immediate insertion
-                            print(f"MAIN_APP ({log_id}): Showing correction window for review...")
-                            self._waiting_for_correction = True
-                            self._pending_transcription_text = transcribed_text  # Store for cancel handler
-                            AppHelper.callAfter(self.correction_window.show, transcribed_text)
-                    # No explicit 'else' for transcribed_text == "" here as we return early if blank
+
+                    # We have non-blank transcription
+                    if transcribed_text == self._last_transcribed_text:
+                        pass
+                    else:
+                        print("--- Transcribed Text ---")
+                        print(transcribed_text)
+                        if transcription_result.has_timestamps:
+                            print(f"Duration: {transcription_result.formatted_duration()}")
+                            print(f"Segments: {len(transcription_result.segment_timestamps)}, Words: {len(transcription_result.word_timestamps)}")
+                        print("------------------------")
+                        # Show correction window instead of immediate insertion
+                        print(f"MAIN_APP ({log_id}): Showing correction window for review...")
+                        self._waiting_for_correction = True
+                        self._pending_transcription_result = transcription_result  # Store full result
+                        self._pending_transcription_text = transcribed_text  # Store text for cancel handler
+                        AppHelper.callAfter(self.correction_window.show, transcription_result)
                 finally:
                     # This 'finally' is for the inner try related to processing transcription text and errors.
                     # The main state flags (is_transcribing, dictation_active) are reset in the outer finally block.
@@ -1414,11 +1526,8 @@ class DictationApp(rumps.App):
 
         # Store for deferred update
         self._pending_hotkey = new_hotkey
-        # Stop settings listener before update to avoid conflicts
-        if hasattr(self, '_settings_listener') and self._settings_listener:
-            print("MAIN_APP: Stopping settings listener before hotkey update")
-            self._settings_listener.stop()
-            self._settings_listener = None
+        # Stop settings listener/monitor before update to avoid conflicts
+        self._stop_settings_shortcut()
         # Defer the actual update to avoid threading issues with rumps
         print(f"MAIN_APP: Scheduling hotkey update to '{new_hotkey}'")
         rumps.Timer(self._do_hotkey_update, 0.1).start()
@@ -1473,7 +1582,10 @@ class DictationApp(rumps.App):
         print("MAIN_APP: Quit - Stopping hotkey manager.")
         if self.hotkey_manager: # Check if hotkey manager was initialized
             self.hotkey_manager.stop_listening()
-        
+
+        print("MAIN_APP: Quit - Stopping settings shortcut.")
+        self._stop_settings_shortcut()
+
         rumps.quit_application()
 
 if __name__ == "__main__":

@@ -7,6 +7,8 @@ import threading
 import time # Ensure time is imported at the top
 import logging
 
+from transcription_result import TranscriptionResult
+
 # Set up logging for ASR service
 logger = logging.getLogger('ASRService')
 
@@ -108,9 +110,14 @@ class ASRService:
 
         if audio_data_np.size == 0:
             print("ASR_SERVICE (worker): Cannot transcribe empty audio.")
-            return "", None # Empty string, no error for empty audio
+            return TranscriptionResult.from_text_only("", 0.0), None  # Empty result, no error
 
         print(f"ASR_SERVICE (worker): Transcribing audio of length {len(audio_data_np)} samples.")
+
+        # Calculate audio duration (assuming 16kHz sample rate)
+        sample_rate = 16000
+        audio_duration = len(audio_data_np) / sample_rate
+        print(f"ASR_SERVICE (worker): Audio duration: {audio_duration:.2f} seconds")
 
         # Audio diagnostics
         audio_max = np.max(np.abs(audio_data_np))
@@ -120,7 +127,7 @@ class ASRService:
         if audio_max < 0.01:
             print("ASR_SERVICE (worker): WARNING - Audio level very low! May be silence or microphone not working.")
 
-        transcribed_text = "" # Default to empty string
+        transcription_result = None
         try:
             with torch.no_grad():
                 # Actual transcription
@@ -146,33 +153,71 @@ class ASRService:
                         print("ASR_SERVICE (worker): WARNING – no safe way to reset decoder; results may repeat.")
                 except Exception as e:
                     print(f"ASR_SERVICE (worker): Decoder-reset step threw: {e}")
-                transcription_results = self.asr_model.transcribe([audio_data_np], batch_size=1)
+
+                # Transcribe with timestamps enabled
+                transcription_results = self.asr_model.transcribe(
+                    [audio_data_np],
+                    batch_size=1,
+                    timestamps=True  # Enable word-level timestamps
+                )
 
                 # Process results: NeMo models usually return a list of transcriptions.
                 # For batch_size=1, it's a list with one item.
-                # This item can be a string or a hypothesis object.
+                # With timestamps=True, the result should be a hypothesis object.
                 if transcription_results and len(transcription_results) > 0:
                     result = transcription_results[0]
+                    print(f"ASR_SERVICE (worker): Result type: {type(result)}")
+
+                    # Handle different result types
                     if isinstance(result, str):
-                        transcribed_text = result.strip()
-                    elif hasattr(result, 'text'):  # Common for hypothesis objects
-                        transcribed_text = result.text
-                    elif isinstance(result, list) and len(result) > 0 and hasattr(result[0], 'text'): # List of hypotheses
-                        transcribed_text = result[0].text
-                    elif isinstance(result, list) and len(result) > 0 and isinstance(result[0], str): # List of strings
-                        transcribed_text = result[0]
+                        # Plain string - no timestamps available
+                        transcription_result = TranscriptionResult.from_text_only(
+                            result.strip(),
+                            audio_duration
+                        )
+                        print(f"ASR_SERVICE (worker): Got plain string result (no timestamps)")
+                    elif hasattr(result, 'text'):
+                        # Hypothesis object - try to extract timestamps
+                        text = result.text if result.text else ""
+                        transcription_result = TranscriptionResult.from_nemo_hypothesis(
+                            result,
+                            audio_duration
+                        )
+                        has_ts = transcription_result.has_timestamps
+                        print(f"ASR_SERVICE (worker): Got hypothesis object, has_timestamps={has_ts}")
+                        if has_ts:
+                            print(f"ASR_SERVICE (worker): Word timestamps: {len(transcription_result.word_timestamps)}")
+                            print(f"ASR_SERVICE (worker): Segment timestamps: {len(transcription_result.segment_timestamps)}")
+                    elif isinstance(result, list) and len(result) > 0:
+                        # List of hypotheses - take the first one
+                        first = result[0]
+                        if hasattr(first, 'text'):
+                            transcription_result = TranscriptionResult.from_nemo_hypothesis(
+                                first,
+                                audio_duration
+                            )
+                        elif isinstance(first, str):
+                            transcription_result = TranscriptionResult.from_text_only(
+                                first.strip(),
+                                audio_duration
+                            )
+                        else:
+                            print(f"ASR_SERVICE (worker): Unexpected list item type: {type(first)}")
+                            transcription_result = TranscriptionResult.from_text_only("", audio_duration)
                     else:
                         print(f"ASR_SERVICE (worker): Unexpected transcription result format: {type(result)}. Content: {result}")
-                        transcribed_text = "" # Fallback
+                        transcription_result = TranscriptionResult.from_text_only("", audio_duration)
                 else:
                     print("ASR_SERVICE (worker): Transcription returned no or empty results.")
-                    transcribed_text = ""
+                    transcription_result = TranscriptionResult.from_text_only("", audio_duration)
 
-                print(f"ASR_SERVICE (worker): Raw transcription: '{transcribed_text}'")
+                print(f"ASR_SERVICE (worker): Raw transcription: '{transcription_result.text}'")
 
-            return transcribed_text, None
+            return transcription_result, None
         except Exception as e:
             print(f"ASR_SERVICE (worker): ERROR during transcription: {e}")
+            import traceback
+            traceback.print_exc()
             return None, e
 
     def _asr_worker_loop(self):

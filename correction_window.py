@@ -7,6 +7,7 @@ Uses PyObjC/AppKit for native macOS integration.
 import objc
 import time
 import logging
+from typing import Union
 
 # Use the same logging as main.py
 logger = logging.getLogger('CorrectionWindow')
@@ -29,8 +30,12 @@ from AppKit import (
     NSFontAttributeName, NSForegroundColorAttributeName,
     NSMutableParagraphStyle, NSParagraphStyleAttributeName,
     NSLeftTextAlignment, NSTextAlignmentLeft,
+    NSSegmentedControl, NSSegmentStyleTexturedSquare,
+    NSSegmentSwitchTrackingSelectOne,
 )
 from Foundation import NSRect, NSPoint, NSSize, NSObject, NSMakeRange, NSNotificationCenter
+
+from transcription_result import TranscriptionResult
 
 # Window dimensions - larger for long-form editing
 WINDOW_WIDTH = 650
@@ -41,9 +46,14 @@ MIN_WINDOW_HEIGHT = 300
 # Layout constants
 PADDING = 20
 TOOLBAR_HEIGHT = 56
+MODE_BAR_HEIGHT = 32
 STATUS_BAR_HEIGHT = 28
 BUTTON_HEIGHT = 32
 BUTTON_WIDTH = 100
+
+# View modes
+MODE_EDIT = 0
+MODE_TIMESTAMPS = 1
 
 
 class CorrectionTextView(NSTextView):
@@ -126,6 +136,7 @@ class CorrectionWindowDelegate(NSObject):
         self._on_copy = callbacks.get('on_copy')
         self._on_clear = callbacks.get('on_clear')
         self._on_resize = callbacks.get('on_resize')
+        self._on_mode_change = callbacks.get('on_mode_change')
         return self
 
     def windowWillClose_(self, notification):
@@ -152,6 +163,10 @@ class CorrectionWindowDelegate(NSObject):
         if self._on_clear:
             self._on_clear()
 
+    def modeChanged_(self, sender):
+        if self._on_mode_change:
+            self._on_mode_change(sender.selectedSegment())
+
 
 class CorrectionWindow:
     """Manages the correction window for reviewing transcriptions."""
@@ -171,9 +186,15 @@ class CorrectionWindow:
         self._status_label = None
         self._instruction_label = None
         self._target_app_label = None
+        self._duration_label = None
+        self._mode_toggle = None
+        self._timestamp_scroll_view = None
+        self._timestamp_text_view = None
         self._on_send_callback = on_send
         self._on_cancel_callback = on_cancel
         self._original_text = ""
+        self._transcription_result = None  # Full TranscriptionResult with timestamps
+        self._current_mode = MODE_EDIT
         self._is_visible = False
         self._previous_app = None  # Store the app that had focus before showing window
         self._setup_window()
@@ -222,6 +243,7 @@ class CorrectionWindow:
             'on_copy': self._do_copy,
             'on_clear': self._do_clear,
             'on_resize': self._update_layout,
+            'on_mode_change': self._on_mode_change,
         }
         self._delegate = CorrectionWindowDelegate.alloc().initWithCallbacks_(callbacks)
         self._window.setDelegate_(self._delegate)
@@ -258,11 +280,15 @@ class CorrectionWindow:
         status_y = button_y + BUTTON_HEIGHT + 12
         text_bottom = status_y + STATUS_BAR_HEIGHT + 8
         toolbar_y = height - TOOLBAR_HEIGHT - 8
-        text_top = toolbar_y - 8
+        mode_bar_y = toolbar_y - MODE_BAR_HEIGHT - 4
+        text_top = mode_bar_y - 8
         text_height = text_top - text_bottom
 
         # === Toolbar at top ===
         self._create_toolbar(content_view, PADDING, toolbar_y, width - 2 * PADDING)
+
+        # === Mode bar (Edit/Timestamps toggle) ===
+        self._create_mode_bar(content_view, PADDING, mode_bar_y, width - 2 * PADDING)
 
         # === Text area (main editing area) ===
         scroll_frame = NSRect(
@@ -296,6 +322,39 @@ class CorrectionWindow:
         self._scroll_view.setDocumentView_(self._text_view)
         content_view.addSubview_(self._scroll_view)
 
+        # === Timestamp view (read-only, same frame as text area) ===
+        self._timestamp_scroll_view = NSScrollView.alloc().initWithFrame_(scroll_frame)
+        self._timestamp_scroll_view.setBorderType_(NSLineBorder)
+        self._timestamp_scroll_view.setHasVerticalScroller_(True)
+        self._timestamp_scroll_view.setHasHorizontalScroller_(False)
+        self._timestamp_scroll_view.setAutohidesScrollers_(True)
+        self._timestamp_scroll_view.setWantsLayer_(True)
+        self._timestamp_scroll_view.layer().setCornerRadius_(8)
+        self._timestamp_scroll_view.layer().setMasksToBounds_(True)
+        self._timestamp_scroll_view.setHidden_(True)  # Hidden by default
+
+        # Create read-only text view for timestamps
+        self._timestamp_text_view = NSTextView.alloc().initWithFrame_(text_frame)
+        self._timestamp_text_view.setEditable_(False)
+        self._timestamp_text_view.setSelectable_(True)
+        self._timestamp_text_view.setFont_(NSFont.monospacedSystemFontOfSize_weight_(13, 0.0))
+        self._timestamp_text_view.setTextColor_(NSColor.labelColor())
+        self._timestamp_text_view.setMinSize_(NSSize(0, scroll_frame.size.height))
+        self._timestamp_text_view.setMaxSize_(NSSize(10000, 10000))
+        self._timestamp_text_view.setVerticallyResizable_(True)
+        self._timestamp_text_view.setHorizontallyResizable_(False)
+        self._timestamp_text_view.textContainer().setWidthTracksTextView_(True)
+        self._timestamp_text_view.textContainer().setLineFragmentPadding_(8)
+
+        # Set line spacing
+        para_style = NSMutableParagraphStyle.alloc().init()
+        para_style.setLineSpacing_(6)
+        para_style.setAlignment_(NSTextAlignmentLeft)
+        self._timestamp_text_view.setDefaultParagraphStyle_(para_style)
+
+        self._timestamp_scroll_view.setDocumentView_(self._timestamp_text_view)
+        content_view.addSubview_(self._timestamp_scroll_view)
+
         # === Status bar ===
         status_frame = NSRect(NSPoint(PADDING, status_y), NSSize(width - 2 * PADDING, STATUS_BAR_HEIGHT))
         self._status_label = NSTextField.alloc().initWithFrame_(status_frame)
@@ -312,13 +371,29 @@ class CorrectionWindow:
         self._create_bottom_buttons(content_view, PADDING, button_y, width)
 
     def _create_toolbar(self, parent_view, x, y, width):
-        """Create the toolbar with instruction and action buttons."""
+        """Create the toolbar with duration, instruction and action buttons."""
         toolbar_view = NSView.alloc().initWithFrame_(
             NSRect(NSPoint(x, y), NSSize(width, TOOLBAR_HEIGHT))
         )
 
-        # Instruction label on the left
-        instruction_frame = NSRect(NSPoint(0, 24), NSSize(width - 200, 20))
+        # Duration label on the far left (pill-style)
+        duration_frame = NSRect(NSPoint(0, 22), NSSize(90, 24))
+        self._duration_label = NSTextField.alloc().initWithFrame_(duration_frame)
+        self._duration_label.setStringValue_("Duration: --")
+        self._duration_label.setBezeled_(False)
+        self._duration_label.setDrawsBackground_(True)
+        self._duration_label.setBackgroundColor_(NSColor.tertiarySystemFillColor())
+        self._duration_label.setEditable_(False)
+        self._duration_label.setSelectable_(False)
+        self._duration_label.setTextColor_(NSColor.secondaryLabelColor())
+        self._duration_label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11, 0.3))
+        self._duration_label.setAlignment_(NSTextAlignmentLeft)
+        self._duration_label.setWantsLayer_(True)
+        self._duration_label.layer().setCornerRadius_(4)
+        toolbar_view.addSubview_(self._duration_label)
+
+        # Instruction label (after duration)
+        instruction_frame = NSRect(NSPoint(100, 24), NSSize(width - 310, 20))
         self._instruction_label = NSTextField.alloc().initWithFrame_(instruction_frame)
         self._instruction_label.setStringValue_("Edit your transcription. Press Enter to insert, Escape to cancel.")
         self._instruction_label.setBezeled_(False)
@@ -330,7 +405,7 @@ class CorrectionWindow:
         toolbar_view.addSubview_(self._instruction_label)
 
         # Target app indicator (below instruction)
-        target_app_frame = NSRect(NSPoint(0, 6), NSSize(width - 200, 16))
+        target_app_frame = NSRect(NSPoint(100, 6), NSSize(width - 310, 16))
         self._target_app_label = NSTextField.alloc().initWithFrame_(target_app_frame)
         self._target_app_label.setStringValue_("")
         self._target_app_label.setBezeled_(False)
@@ -362,6 +437,78 @@ class CorrectionWindow:
         toolbar_view.addSubview_(clear_button)
 
         parent_view.addSubview_(toolbar_view)
+
+    def _create_mode_bar(self, parent_view, x, y, width):
+        """Create the mode bar with Edit/Timestamps toggle."""
+        mode_bar_view = NSView.alloc().initWithFrame_(
+            NSRect(NSPoint(x, y), NSSize(width, MODE_BAR_HEIGHT))
+        )
+
+        # Segmented control for Edit/Timestamps modes
+        toggle_frame = NSRect(NSPoint(0, 4), NSSize(180, 24))
+        self._mode_toggle = NSSegmentedControl.alloc().initWithFrame_(toggle_frame)
+        self._mode_toggle.setSegmentCount_(2)
+        self._mode_toggle.setLabel_forSegment_("Edit Mode", 0)
+        self._mode_toggle.setLabel_forSegment_("Timestamps", 1)
+        self._mode_toggle.setWidth_forSegment_(85, 0)
+        self._mode_toggle.setWidth_forSegment_(85, 1)
+        self._mode_toggle.setSelectedSegment_(self._current_mode)
+        self._mode_toggle.setTarget_(self._delegate)
+        self._mode_toggle.setAction_(objc.selector(self._delegate.modeChanged_, signature=b'v@:@'))
+        mode_bar_view.addSubview_(self._mode_toggle)
+
+        parent_view.addSubview_(mode_bar_view)
+
+    def _on_mode_change(self, new_mode: int):
+        """Handle mode toggle between Edit and Timestamps views."""
+        if new_mode == self._current_mode:
+            return
+
+        self._current_mode = new_mode
+        print(f"CORRECTION: Mode changed to {'Timestamps' if new_mode == MODE_TIMESTAMPS else 'Edit'}")
+
+        if new_mode == MODE_EDIT:
+            # Show edit view, hide timestamp view
+            self._scroll_view.setHidden_(False)
+            self._timestamp_scroll_view.setHidden_(True)
+            # Update instruction
+            if self._instruction_label:
+                self._instruction_label.setStringValue_("Edit your transcription. Press Enter to insert, Escape to cancel.")
+        else:
+            # Show timestamp view, hide edit view
+            self._scroll_view.setHidden_(True)
+            self._timestamp_scroll_view.setHidden_(False)
+            # Update timestamp view content
+            self._update_timestamp_view()
+            # Update instruction
+            if self._instruction_label:
+                self._instruction_label.setStringValue_("Read-only timestamp view. Switch to Edit Mode to modify.")
+
+    def _update_timestamp_view(self):
+        """Update the timestamp view with segment timestamps."""
+        if not self._timestamp_text_view:
+            return
+
+        if not self._transcription_result or not self._transcription_result.has_timestamps:
+            # No timestamps available
+            self._timestamp_text_view.setString_("No timestamp data available for this transcription.")
+            return
+
+        # Check if text was edited (timestamps may not align)
+        current_text = self._text_view.string() if self._text_view else ""
+        was_edited = current_text != self._original_text
+
+        # Build formatted timestamp text
+        lines = []
+        if was_edited:
+            lines.append("Note: Text was edited. Timestamps show original segments.\n")
+
+        for segment in self._transcription_result.segment_timestamps:
+            time_range = segment.formatted_range()
+            lines.append(f"{time_range}  {segment.text}")
+
+        timestamp_text = "\n".join(lines)
+        self._timestamp_text_view.setString_(timestamp_text)
 
     def _create_bottom_buttons(self, parent_view, x, y, width):
         """Create the bottom action buttons."""
@@ -399,12 +546,42 @@ class CorrectionWindow:
 
     def _update_layout(self):
         """Update layout when window is resized."""
+        # Save current mode and text before rebuilding
+        saved_mode = self._current_mode
+        saved_text = getattr(self, '_current_text', '')
+
         self._layout_views()
 
         # Restore text content
-        if hasattr(self, '_current_text'):
-            self._text_view.setString_(self._current_text)
+        if saved_text:
+            self._text_view.setString_(saved_text)
             self._text_view.set_callbacks(self._do_send, self._do_cancel, self._update_status)
+
+        # Restore mode state
+        if self._mode_toggle:
+            self._mode_toggle.setSelectedSegment_(saved_mode)
+            # Re-apply mode visibility
+            if saved_mode == MODE_TIMESTAMPS:
+                self._scroll_view.setHidden_(True)
+                self._timestamp_scroll_view.setHidden_(False)
+                self._update_timestamp_view()
+            else:
+                self._scroll_view.setHidden_(False)
+                self._timestamp_scroll_view.setHidden_(True)
+
+        # Update duration label
+        if self._duration_label and self._transcription_result:
+            duration_str = self._transcription_result.formatted_duration()
+            self._duration_label.setStringValue_(f" Duration: {duration_str}")
+
+        # Update timestamps availability
+        if self._mode_toggle and self._transcription_result:
+            has_timestamps = self._transcription_result.has_timestamps
+            self._mode_toggle.setEnabled_forSegment_(has_timestamps, MODE_TIMESTAMPS)
+            if not has_timestamps:
+                self._mode_toggle.setLabel_forSegment_("Timestamps (N/A)", MODE_TIMESTAMPS)
+            else:
+                self._mode_toggle.setLabel_forSegment_("Timestamps", MODE_TIMESTAMPS)
 
     def _update_status(self):
         """Update the character/word count status."""
@@ -500,14 +677,27 @@ class CorrectionWindow:
         if self._on_cancel_callback:
             self._on_cancel_callback()
 
-    def show(self, text: str):
+    def show(self, transcription: Union[TranscriptionResult, str]):
         """
-        Show the correction window with the given text.
+        Show the correction window with the given transcription.
 
         Args:
-            text: The transcribed text to display for editing.
+            transcription: Either a TranscriptionResult object or plain text string.
         """
-        print(f"CORRECTION: show() called with text: '{text[:50]}...'")
+        # Handle both TranscriptionResult and plain string
+        if isinstance(transcription, TranscriptionResult):
+            self._transcription_result = transcription
+            # Use formatted text with paragraph breaks between segments
+            text = transcription.formatted_with_breaks()
+            print(f"CORRECTION: show() called with TranscriptionResult: '{text[:50]}...'")
+            print(f"CORRECTION: Duration: {transcription.formatted_duration()}, has_timestamps: {transcription.has_timestamps}")
+            if transcription.has_timestamps:
+                print(f"CORRECTION: Text formatted with {len(transcription.segment_timestamps)} paragraph breaks")
+        else:
+            # Plain string - wrap in TranscriptionResult for consistency
+            text = str(transcription)
+            self._transcription_result = TranscriptionResult.from_text_only(text)
+            print(f"CORRECTION: show() called with plain text: '{text[:50]}...'")
 
         # Capture the currently focused app BEFORE showing our window
         workspace = NSWorkspace.sharedWorkspace()
@@ -517,9 +707,28 @@ class CorrectionWindow:
 
         self._original_text = text
         self._current_text = text
+        self._current_mode = MODE_EDIT  # Reset to edit mode
 
         # Ensure layout is fresh (this recreates all UI elements)
         self._layout_views()
+
+        # Update duration label
+        if self._duration_label and self._transcription_result:
+            duration_str = self._transcription_result.formatted_duration()
+            self._duration_label.setStringValue_(f" Duration: {duration_str}")
+            print(f"CORRECTION: Set duration label to: 'Duration: {duration_str}'")
+
+        # Update mode toggle state and enable/disable timestamps mode
+        if self._mode_toggle:
+            self._mode_toggle.setSelectedSegment_(MODE_EDIT)
+            # Disable timestamps segment if no timestamp data
+            has_timestamps = self._transcription_result and self._transcription_result.has_timestamps
+            self._mode_toggle.setEnabled_forSegment_(has_timestamps, MODE_TIMESTAMPS)
+            if not has_timestamps:
+                # Visual feedback that timestamps aren't available
+                self._mode_toggle.setLabel_forSegment_("Timestamps (N/A)", MODE_TIMESTAMPS)
+            else:
+                self._mode_toggle.setLabel_forSegment_("Timestamps", MODE_TIMESTAMPS)
 
         # Update target app label AFTER _layout_views() since it recreates the label
         print(f"CORRECTION: _target_app_label exists: {self._target_app_label is not None}")
