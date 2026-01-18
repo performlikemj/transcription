@@ -11,13 +11,14 @@ from AppKit import (
     NSTextFieldCell, NSBezelStyleRounded, NSScreen,
     NSEventModifierFlagCommand, NSEventModifierFlagShift,
     NSEventModifierFlagOption, NSEventModifierFlagControl,
-    NSCenterTextAlignment, NSWindowCollectionBehaviorMoveToActiveSpace
+    NSCenterTextAlignment, NSWindowCollectionBehaviorMoveToActiveSpace,
+    NSSlider, NSButtonTypeSwitch, NSControlStateValueOn, NSControlStateValueOff
 )
 from Foundation import NSRect, NSPoint, NSSize, NSObject
 
 # Window dimensions
-WINDOW_WIDTH = 400
-WINDOW_HEIGHT = 220
+WINDOW_WIDTH = 450
+WINDOW_HEIGHT = 380
 
 # Special key code mappings (macOS keyCode -> pynput format)
 SPECIAL_KEY_MAP = {
@@ -285,6 +286,9 @@ class PreferencesWindowDelegate(NSObject):
         self._on_close = callbacks.get('on_close')
         self._on_save = callbacks.get('on_save')
         self._on_reset = callbacks.get('on_reset')
+        self._on_silence_enabled_changed = callbacks.get('on_silence_enabled_changed')
+        self._on_silence_slider_changed = callbacks.get('on_silence_slider_changed')
+        self._on_skip_edit_changed = callbacks.get('on_skip_edit_changed')
         return self
 
     def windowWillClose_(self, notification):
@@ -301,19 +305,55 @@ class PreferencesWindowDelegate(NSObject):
         if self._on_reset:
             self._on_reset()
 
+    def silenceEnabledChanged_(self, sender):
+        print("PREFERENCES: Silence enabled checkbox changed (via delegate)")
+        try:
+            if self._on_silence_enabled_changed:
+                self._on_silence_enabled_changed(sender)
+        except Exception as e:
+            print(f"PREFERENCES ERROR in silenceEnabledChanged_: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def silenceSliderChanged_(self, sender):
+        try:
+            if self._on_silence_slider_changed:
+                self._on_silence_slider_changed(sender)
+        except Exception as e:
+            print(f"PREFERENCES ERROR in silenceSliderChanged_: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def skipEditChanged_(self, sender):
+        print("PREFERENCES: Skip edit checkbox changed (via delegate)")
+        try:
+            if self._on_skip_edit_changed:
+                self._on_skip_edit_changed(sender)
+        except Exception as e:
+            print(f"PREFERENCES ERROR in skipEditChanged_: {e}")
+            import traceback
+            traceback.print_exc()
+
 
 class PreferencesWindow:
     """Manages the preferences window lifecycle."""
 
-    def __init__(self, current_hotkey: str, on_hotkey_changed, on_reset):
+    def __init__(self, current_hotkey: str, on_hotkey_changed, on_reset, settings_manager=None, on_settings_changed=None):
         self._window = None
         self._hotkey_recorder = None
         self._current_label = None
         self._on_hotkey_changed = on_hotkey_changed
         self._on_reset_callback = on_reset
+        self._on_settings_changed = on_settings_changed
+        self._settings_manager = settings_manager
         self._current_hotkey = current_hotkey
         self._is_visible = False
         self._delegate = None
+        # New UI elements
+        self._silence_enabled_checkbox = None
+        self._silence_slider = None
+        self._silence_value_label = None
+        self._skip_edit_checkbox = None
         self._setup_window()
         print(f"PREFERENCES: Window initialized with hotkey '{current_hotkey}'")
 
@@ -349,6 +389,9 @@ class PreferencesWindow:
             'on_close': self._on_window_close,
             'on_save': self._do_save,
             'on_reset': self._do_reset,
+            'on_silence_enabled_changed': self._on_silence_enabled_changed,
+            'on_silence_slider_changed': self._on_silence_slider_changed,
+            'on_skip_edit_changed': self._on_skip_edit_changed,
         }
         self._delegate = PreferencesWindowDelegate.alloc().initWithCallbacks_(callbacks)
         self._window.setDelegate_(self._delegate)
@@ -359,10 +402,12 @@ class PreferencesWindow:
         content_view.setWantsLayer_(True)
 
         # Layout from top to bottom (remember: macOS Y=0 is at bottom)
-        # Content area is about 190px (220 - 30 for title bar)
+        # Window is 380px tall, content area is about 350px (380 - 30 for title bar)
+        y_pos = 320  # Start near top
 
+        # ============ SECTION 1: Dictation Hotkey ============
         # Add "Dictation Hotkey:" label at top
-        label_frame = NSRect(NSPoint(20, 160), NSSize(200, 20))
+        label_frame = NSRect(NSPoint(20, y_pos), NSSize(200, 20))
         label = NSTextField.alloc().initWithFrame_(label_frame)
         label.setStringValue_("Dictation Hotkey:")
         label.setBezeled_(False)
@@ -371,16 +416,18 @@ class PreferencesWindow:
         label.setSelectable_(False)
         label.setFont_(NSFont.boldSystemFontOfSize_(13))
         content_view.addSubview_(label)
+        y_pos -= 50
 
-        # Add hotkey recorder view - make it taller and more prominent
-        recorder_frame = NSRect(NSPoint(20, 110), NSSize(WINDOW_WIDTH - 40, 44))
+        # Add hotkey recorder view
+        recorder_frame = NSRect(NSPoint(20, y_pos), NSSize(WINDOW_WIDTH - 40, 44))
         self._hotkey_recorder = HotkeyRecorderView.alloc().initWithFrame_(recorder_frame)
         self._hotkey_recorder.setHotkey_(self._current_hotkey)
         self._hotkey_recorder.setOnChangeCallback_(self._on_recorder_change)
         content_view.addSubview_(self._hotkey_recorder)
+        y_pos -= 25
 
         # Add instruction label below recorder
-        instruction_frame = NSRect(NSPoint(20, 85), NSSize(WINDOW_WIDTH - 40, 20))
+        instruction_frame = NSRect(NSPoint(20, y_pos), NSSize(WINDOW_WIDTH - 40, 20))
         instruction_label = NSTextField.alloc().initWithFrame_(instruction_frame)
         instruction_label.setStringValue_("Click above, then press your desired hotkey combination")
         instruction_label.setBezeled_(False)
@@ -390,9 +437,10 @@ class PreferencesWindow:
         instruction_label.setTextColor_(NSColor.grayColor())
         instruction_label.setFont_(NSFont.systemFontOfSize_(11))
         content_view.addSubview_(instruction_label)
+        y_pos -= 20
 
         # Add current hotkey label
-        current_frame = NSRect(NSPoint(20, 55), NSSize(WINDOW_WIDTH - 40, 20))
+        current_frame = NSRect(NSPoint(20, y_pos), NSSize(WINDOW_WIDTH - 40, 20))
         self._current_label = NSTextField.alloc().initWithFrame_(current_frame)
         self._current_label.setStringValue_(f"Current: {hotkey_to_display(self._current_hotkey)}")
         self._current_label.setBezeled_(False)
@@ -401,8 +449,112 @@ class PreferencesWindow:
         self._current_label.setSelectable_(False)
         self._current_label.setTextColor_(NSColor.grayColor())
         content_view.addSubview_(self._current_label)
+        y_pos -= 35
 
-        # Add Reset button - make it wider
+        # ============ SECTION 2: Silence Detection ============
+        # Section label
+        silence_label_frame = NSRect(NSPoint(20, y_pos), NSSize(200, 20))
+        silence_label = NSTextField.alloc().initWithFrame_(silence_label_frame)
+        silence_label.setStringValue_("Silence Detection:")
+        silence_label.setBezeled_(False)
+        silence_label.setDrawsBackground_(False)
+        silence_label.setEditable_(False)
+        silence_label.setSelectable_(False)
+        silence_label.setFont_(NSFont.boldSystemFontOfSize_(13))
+        content_view.addSubview_(silence_label)
+        y_pos -= 28
+
+        # Auto-stop checkbox
+        silence_checkbox_frame = NSRect(NSPoint(20, y_pos), NSSize(250, 22))
+        self._silence_enabled_checkbox = NSButton.alloc().initWithFrame_(silence_checkbox_frame)
+        self._silence_enabled_checkbox.setButtonType_(NSButtonTypeSwitch)
+        self._silence_enabled_checkbox.setTitle_("Auto-stop after silence")
+        self._silence_enabled_checkbox.setFont_(NSFont.systemFontOfSize_(13))
+        # Set initial state from settings
+        if self._settings_manager:
+            enabled = self._settings_manager.get_silence_auto_stop_enabled()
+            self._silence_enabled_checkbox.setState_(NSControlStateValueOn if enabled else NSControlStateValueOff)
+        else:
+            self._silence_enabled_checkbox.setState_(NSControlStateValueOn)
+        self._silence_enabled_checkbox.setTarget_(self._delegate)
+        self._silence_enabled_checkbox.setAction_(objc.selector(self._delegate.silenceEnabledChanged_, signature=b'v@:@'))
+        content_view.addSubview_(self._silence_enabled_checkbox)
+        y_pos -= 30
+
+        # Slider row: slider + value label
+        slider_frame = NSRect(NSPoint(40, y_pos), NSSize(WINDOW_WIDTH - 140, 22))
+        self._silence_slider = NSSlider.alloc().initWithFrame_(slider_frame)
+        self._silence_slider.setMinValue_(0.5)
+        self._silence_slider.setMaxValue_(10.0)
+        # Set initial value from settings
+        if self._settings_manager:
+            duration = self._settings_manager.get_silence_duration()
+            self._silence_slider.setFloatValue_(duration)
+            enabled = self._settings_manager.get_silence_auto_stop_enabled()
+            self._silence_slider.setEnabled_(enabled)
+        else:
+            self._silence_slider.setFloatValue_(2.0)
+        self._silence_slider.setTarget_(self._delegate)
+        self._silence_slider.setAction_(objc.selector(self._delegate.silenceSliderChanged_, signature=b'v@:@'))
+        content_view.addSubview_(self._silence_slider)
+
+        # Value label next to slider
+        value_label_frame = NSRect(NSPoint(WINDOW_WIDTH - 90, y_pos), NSSize(70, 22))
+        self._silence_value_label = NSTextField.alloc().initWithFrame_(value_label_frame)
+        current_duration = self._silence_slider.floatValue()
+        self._silence_value_label.setStringValue_(f"{current_duration:.1f} sec")
+        self._silence_value_label.setBezeled_(False)
+        self._silence_value_label.setDrawsBackground_(False)
+        self._silence_value_label.setEditable_(False)
+        self._silence_value_label.setSelectable_(False)
+        self._silence_value_label.setFont_(NSFont.systemFontOfSize_(12))
+        content_view.addSubview_(self._silence_value_label)
+        y_pos -= 35
+
+        # ============ SECTION 3: After Transcription ============
+        # Section label
+        after_label_frame = NSRect(NSPoint(20, y_pos), NSSize(200, 20))
+        after_label = NSTextField.alloc().initWithFrame_(after_label_frame)
+        after_label.setStringValue_("After Transcription:")
+        after_label.setBezeled_(False)
+        after_label.setDrawsBackground_(False)
+        after_label.setEditable_(False)
+        after_label.setSelectable_(False)
+        after_label.setFont_(NSFont.boldSystemFontOfSize_(13))
+        content_view.addSubview_(after_label)
+        y_pos -= 28
+
+        # Skip edit window checkbox
+        skip_checkbox_frame = NSRect(NSPoint(20, y_pos), NSSize(300, 22))
+        self._skip_edit_checkbox = NSButton.alloc().initWithFrame_(skip_checkbox_frame)
+        self._skip_edit_checkbox.setButtonType_(NSButtonTypeSwitch)
+        self._skip_edit_checkbox.setTitle_("Show edit window for review")
+        self._skip_edit_checkbox.setFont_(NSFont.systemFontOfSize_(13))
+        # Set initial state from settings (inverted: skip_edit=False means show=True)
+        if self._settings_manager:
+            skip = self._settings_manager.get_skip_edit_window()
+            self._skip_edit_checkbox.setState_(NSControlStateValueOff if skip else NSControlStateValueOn)
+        else:
+            self._skip_edit_checkbox.setState_(NSControlStateValueOn)
+        self._skip_edit_checkbox.setTarget_(self._delegate)
+        self._skip_edit_checkbox.setAction_(objc.selector(self._delegate.skipEditChanged_, signature=b'v@:@'))
+        content_view.addSubview_(self._skip_edit_checkbox)
+        y_pos -= 22
+
+        # Help text for skip edit
+        skip_help_frame = NSRect(NSPoint(40, y_pos), NSSize(WINDOW_WIDTH - 60, 20))
+        skip_help_label = NSTextField.alloc().initWithFrame_(skip_help_frame)
+        skip_help_label.setStringValue_("When off, text inserts immediately without review")
+        skip_help_label.setBezeled_(False)
+        skip_help_label.setDrawsBackground_(False)
+        skip_help_label.setEditable_(False)
+        skip_help_label.setSelectable_(False)
+        skip_help_label.setTextColor_(NSColor.grayColor())
+        skip_help_label.setFont_(NSFont.systemFontOfSize_(11))
+        content_view.addSubview_(skip_help_label)
+
+        # ============ BUTTONS at bottom ============
+        # Add Reset button
         reset_frame = NSRect(NSPoint(20, 15), NSSize(140, 32))
         reset_button = NSButton.alloc().initWithFrame_(reset_frame)
         reset_button.setTitle_("Reset to Default")
@@ -422,6 +574,63 @@ class PreferencesWindow:
 
         self._window.setContentView_(content_view)
 
+    def _on_silence_enabled_changed(self, sender):
+        """Called when silence auto-stop checkbox changes."""
+        try:
+            enabled = sender.state() == NSControlStateValueOn
+            print(f"PREFERENCES: Silence auto-stop enabled: {enabled}")
+            # Enable/disable slider based on checkbox
+            if self._silence_slider:
+                self._silence_slider.setEnabled_(enabled)
+            # Save immediately
+            if self._settings_manager:
+                self._settings_manager.set_silence_auto_stop_enabled(enabled)
+                if self._on_settings_changed:
+                    self._on_settings_changed()
+            print("PREFERENCES: Silence enabled change complete")
+        except Exception as e:
+            print(f"PREFERENCES ERROR in _on_silence_enabled_changed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_silence_slider_changed(self, sender):
+        """Called when silence duration slider changes."""
+        try:
+            value = sender.floatValue()
+            # Round to nearest 0.5
+            rounded = round(value * 2) / 2
+            print(f"PREFERENCES: Silence duration: {rounded:.1f}s")
+            # Update label
+            if self._silence_value_label:
+                self._silence_value_label.setStringValue_(f"{rounded:.1f} sec")
+            # Save immediately
+            if self._settings_manager:
+                self._settings_manager.set_silence_duration(rounded)
+                if self._on_settings_changed:
+                    self._on_settings_changed()
+        except Exception as e:
+            print(f"PREFERENCES ERROR in _on_silence_slider_changed: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def _on_skip_edit_changed(self, sender):
+        """Called when skip edit window checkbox changes."""
+        try:
+            # Checkbox is "Show edit window", so skip = NOT checked
+            show_edit = sender.state() == NSControlStateValueOn
+            skip = not show_edit
+            print(f"PREFERENCES: Skip edit window: {skip}")
+            # Save immediately
+            if self._settings_manager:
+                self._settings_manager.set_skip_edit_window(skip)
+                if self._on_settings_changed:
+                    self._on_settings_changed()
+            print("PREFERENCES: Skip edit change complete")
+        except Exception as e:
+            print(f"PREFERENCES ERROR in _on_skip_edit_changed: {e}")
+            import traceback
+            traceback.print_exc()
+
     def _on_recorder_change(self, new_hotkey):
         """Called when user records a new hotkey."""
         print(f"PREFERENCES: Recorder changed to '{new_hotkey}'")
@@ -433,11 +642,31 @@ class PreferencesWindow:
         """Handle Reset button click."""
         print("PREFERENCES: _do_reset called")
         from settings_manager import SettingsManager
+        # Reset hotkey
         default_hotkey = SettingsManager.DEFAULT_HOTKEY
         self._hotkey_recorder.setHotkey_(default_hotkey)
         self._current_label.setStringValue_(f"Reset to: {hotkey_to_display(default_hotkey)}")
+        # Reset silence settings
+        if self._silence_enabled_checkbox:
+            self._silence_enabled_checkbox.setState_(
+                NSControlStateValueOn if SettingsManager.DEFAULT_SILENCE_AUTO_STOP_ENABLED else NSControlStateValueOff
+            )
+        if self._silence_slider:
+            self._silence_slider.setFloatValue_(SettingsManager.DEFAULT_SILENCE_DURATION)
+            self._silence_slider.setEnabled_(SettingsManager.DEFAULT_SILENCE_AUTO_STOP_ENABLED)
+        if self._silence_value_label:
+            self._silence_value_label.setStringValue_(f"{SettingsManager.DEFAULT_SILENCE_DURATION:.1f} sec")
+        # Reset skip edit setting
+        if self._skip_edit_checkbox:
+            # Show edit window = NOT skip_edit
+            self._skip_edit_checkbox.setState_(
+                NSControlStateValueOff if SettingsManager.DEFAULT_SKIP_EDIT_WINDOW else NSControlStateValueOn
+            )
         if self._on_reset_callback:
             self._on_reset_callback()
+        # Notify settings changed
+        if self._on_settings_changed:
+            self._on_settings_changed()
 
     def _do_save(self):
         """Handle Save button click."""
@@ -465,6 +694,27 @@ class PreferencesWindow:
         # Update the recorder with current hotkey
         self._hotkey_recorder.setHotkey_(self._current_hotkey)
         self._current_label.setStringValue_(f"Current: {hotkey_to_display(self._current_hotkey)}")
+
+        # Refresh silence settings from settings manager
+        if self._settings_manager:
+            silence_enabled = self._settings_manager.get_silence_auto_stop_enabled()
+            silence_duration = self._settings_manager.get_silence_duration()
+            skip_edit = self._settings_manager.get_skip_edit_window()
+
+            if self._silence_enabled_checkbox:
+                self._silence_enabled_checkbox.setState_(
+                    NSControlStateValueOn if silence_enabled else NSControlStateValueOff
+                )
+            if self._silence_slider:
+                self._silence_slider.setFloatValue_(silence_duration)
+                self._silence_slider.setEnabled_(silence_enabled)
+            if self._silence_value_label:
+                self._silence_value_label.setStringValue_(f"{silence_duration:.1f} sec")
+            if self._skip_edit_checkbox:
+                # Show edit = NOT skip
+                self._skip_edit_checkbox.setState_(
+                    NSControlStateValueOff if skip_edit else NSControlStateValueOn
+                )
 
         # Always bring window to front
         self._is_visible = True

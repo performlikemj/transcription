@@ -445,9 +445,11 @@ class DictationApp(rumps.App):
             on_cancel=self._on_correction_cancel
         )
 
-        # Silence detection settings for auto-send
-        self.silence_threshold = 150  # RMS level below which audio is considered silence (lowered from 500)
-        self.silence_duration = 2.0   # Seconds of silence before auto-sending
+        # Silence detection settings for auto-send (loaded from settings manager)
+        self.silence_threshold = 150  # RMS level below which audio is considered silence (constant)
+        self.silence_auto_stop_enabled = self.settings_manager.get_silence_auto_stop_enabled()
+        self.silence_duration = self.settings_manager.get_silence_duration()
+        self.skip_edit_window = self.settings_manager.get_skip_edit_window()
         self._last_sound_time = None  # Timestamp of last non-silent audio
         self._auto_stop_pending = False  # Prevent multiple auto-stops
         self._waiting_for_correction = False  # True while correction window is open
@@ -776,8 +778,8 @@ class DictationApp(rumps.App):
         if self.live_transcription_service.is_active:
             self.live_transcription_service.add_audio_chunk(chunk)
 
-        # Silence detection for auto-send
-        if self.dictation_active and not self._auto_stop_pending:
+        # Silence detection for auto-send (only if enabled)
+        if self.dictation_active and not self._auto_stop_pending and self.silence_auto_stop_enabled:
             # Calculate RMS (root mean square) of the audio chunk
             audio_data = chunk.flatten().astype(np.float32)
             rms = np.sqrt(np.mean(audio_data ** 2))
@@ -950,12 +952,18 @@ class DictationApp(rumps.App):
                             print(f"Duration: {transcription_result.formatted_duration()}")
                             print(f"Segments: {len(transcription_result.segment_timestamps)}, Words: {len(transcription_result.word_timestamps)}")
                         print("------------------------")
-                        # Show correction window instead of immediate insertion
-                        print(f"MAIN_APP ({log_id}): Showing correction window for review...")
-                        self._waiting_for_correction = True
-                        self._pending_transcription_result = transcription_result  # Store full result
-                        self._pending_transcription_text = transcribed_text  # Store text for cancel handler
-                        AppHelper.callAfter(self.correction_window.show, transcription_result)
+                        # Check if we should skip the edit window
+                        if self.skip_edit_window:
+                            # Direct insertion without edit window
+                            print(f"MAIN_APP ({log_id}): Skip edit window enabled, inserting directly...")
+                            self._handle_direct_insertion(transcription_result, transcribed_text, log_id)
+                        else:
+                            # Show correction window for review
+                            print(f"MAIN_APP ({log_id}): Showing correction window for review...")
+                            self._waiting_for_correction = True
+                            self._pending_transcription_result = transcription_result  # Store full result
+                            self._pending_transcription_text = transcribed_text  # Store text for cancel handler
+                            AppHelper.callAfter(self.correction_window.show, transcription_result)
                 finally:
                     # This 'finally' is for the inner try related to processing transcription text and errors.
                     # The main state flags (is_transcribing, dictation_active) are reset in the outer finally block.
@@ -1358,6 +1366,69 @@ class DictationApp(rumps.App):
         print(f"HISTORY DEBUG: Scheduling _update_history_menu via AppHelper.callAfter")
         AppHelper.callAfter(self._update_history_menu)
 
+    def _handle_direct_insertion(self, transcription_result, transcribed_text: str, log_id: str):
+        """Insert text directly without showing the correction window."""
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+
+        # Use formatted text with paragraph breaks (same as edit window) for consistency
+        formatted_text = transcription_result.formatted_with_breaks() if transcription_result else transcribed_text
+
+        # Edge case: empty transcription
+        if not formatted_text or not formatted_text.strip():
+            print(f"MAIN_APP ({log_id}): Empty transcription, skipping insertion")
+            rumps.notification("Dictation Complete", "No speech detected.", "")
+            self._finish_transcription_cycle()
+            return
+
+        # Use the source app captured when dictation started
+        source_app = getattr(self, '_dictation_source_app', None)
+        if source_app:
+            target_app_name = source_app.localizedName() or ""
+            bundle_id = source_app.bundleIdentifier() or ""
+            non_text_bundles = {"com.apple.finder", "com.apple.dock.extra", "com.apple.loginwindow"}
+            target_likely_text = bundle_id not in non_text_bundles and bundle_id != ""
+            print(f"MAIN_APP ({log_id}): Source app: '{target_app_name}' ({bundle_id})")
+
+            # Restore focus to source app
+            source_app.activateWithOptions_(0)
+            time.sleep(0.1)
+        else:
+            target_app_name = ""
+            target_likely_text = False
+            print(f"MAIN_APP ({log_id}): No source app captured")
+
+        # Add to history (original == corrected when no editing)
+        self._add_to_history(formatted_text, formatted_text)
+
+        # Copy to clipboard as safety net
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(formatted_text, NSPasteboardTypeString)
+
+        # Insert text
+        if not target_likely_text:
+            print(f"MAIN_APP ({log_id}): Skipping keyboard insertion - target not text-accepting")
+            show_toast("Text Copied", "Press Cmd+V to paste")
+        else:
+            try:
+                insertion_result = self.text_insertion_service.insert_text(formatted_text)
+                if insertion_result:
+                    char_count = len(formatted_text)
+                    msg = f"Inserted {char_count} characters"
+                    if target_app_name:
+                        msg += f" into {target_app_name}"
+                    show_toast("Transcription Complete", msg)
+                else:
+                    rumps.notification("Insertion Failed",
+                        "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
+            except Exception as e:
+                print(f"MAIN_APP ({log_id}): Error during text insertion: {e}")
+                rumps.notification("Insertion Error",
+                    "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
+
+        self._last_transcribed_text = formatted_text
+        self._finish_transcription_cycle()
+
     def _on_correction_send(self, original_text: str, corrected_text: str):
         """Called when user confirms corrected text in the correction window."""
         print(f"MAIN_APP: Correction confirmed. Original: '{original_text[:30]}...', Corrected: '{corrected_text[:30]}...'")
@@ -1496,7 +1567,9 @@ class DictationApp(rumps.App):
             self.preferences_window = PreferencesWindow(
                 current_hotkey=self.hotkey_string,
                 on_hotkey_changed=self._on_hotkey_changed,
-                on_reset=self._on_hotkey_reset
+                on_reset=self._on_hotkey_reset,
+                settings_manager=self.settings_manager,
+                on_settings_changed=self._on_settings_changed
             )
         self.preferences_window.set_current_hotkey(self.hotkey_string)
         self.preferences_window.show()
@@ -1565,6 +1638,14 @@ class DictationApp(rumps.App):
         default_hotkey = SettingsManager.DEFAULT_HOTKEY
         if default_hotkey != self.hotkey_string:
             self._on_hotkey_changed(default_hotkey)
+
+    def _on_settings_changed(self):
+        """Callback when any setting changes in preferences."""
+        self.silence_auto_stop_enabled = self.settings_manager.get_silence_auto_stop_enabled()
+        self.silence_duration = self.settings_manager.get_silence_duration()
+        self.skip_edit_window = self.settings_manager.get_skip_edit_window()
+        print(f"MAIN_APP: Settings updated - silence_auto_stop={self.silence_auto_stop_enabled}, "
+              f"silence_duration={self.silence_duration}, skip_edit={self.skip_edit_window}")
 
     @rumps.clicked("Quit")
     def quit_app(self, _):
