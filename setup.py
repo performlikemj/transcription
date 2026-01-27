@@ -31,12 +31,12 @@ def find_parakeet_model():
     return None, None
 
 
-# Find the model dynamically - supports any parakeet-tdt version
+# Model is no longer bundled — it downloads on first launch.
+# find_parakeet_model() is kept for reference but not required at build time.
 MODEL_DIR, MODEL_FILE = find_parakeet_model()
 if MODEL_DIR is None:
-    print("⚠️  Warning: No parakeet-tdt-* model directory found!")
-    print("   Please download a Parakeet model before building.")
-    MODEL_DIR = "parakeet-tdt-model"  # Placeholder
+    print("ℹ️  No local parakeet-tdt-* model found (expected — model downloads on first launch).")
+    MODEL_DIR = ""
     MODEL_FILE = ""
 
 def _patch_torio_docstring_issue():
@@ -140,7 +140,7 @@ PY2APP_OPTS = dict(
         "pandas.tests","scipy.tests","sklearn.tests",
         "torch.testing","numba.tests",
     ],
-    resources   = [MODEL_FILE, "icon.png", "menubar_icon.png", "ui_config.py"],  # Include the model file and icons
+    resources   = ["icon.png", "menubar_icon.png", "ui_config.py"],  # Model downloads on first launch
     frameworks  = ["/opt/homebrew/lib/libsndfile.dylib"],
     site_packages = False,
     plist = {
@@ -226,25 +226,7 @@ def _fix_torio_rpaths(plat_app):
 
 
 def _fix_torchaudio(plat_app):
-    # First, fix the model directory structure
-    import shutil
-
-    # Ensure the model is in the correct location
-    app_resources = pathlib.Path(plat_app) / "Contents/Resources"
-    source_model = pathlib.Path(MODEL_FILE) if MODEL_FILE else None
-
-    # Copy the .nemo file directly to Resources (not in a subdirectory)
-    # This matches how find_parakeet_model() searches in main.py
-    if source_model and source_model.exists():
-        model_dest_file = app_resources / source_model.name
-        if not model_dest_file.exists():
-            print(f"Copying model from {source_model} to {model_dest_file}")
-            shutil.copy2(str(source_model), str(model_dest_file))
-            print(f"✓ Model copied to correct location")
-        else:
-            print(f"✓ Model already exists at {model_dest_file}")
-    else:
-        print(f"⚠️  Warning: Could not find source model at {MODEL_FILE}")
+    # Model is no longer bundled — it downloads on first launch.
 
     # Fix torio rpaths first (before torchaudio since torchaudio may depend on it)
     _fix_torio_rpaths(plat_app)

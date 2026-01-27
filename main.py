@@ -59,7 +59,7 @@ def log_print(*args, **kwargs):
 print = log_print
 
 import rumps
-from app_paths import resolve_resource_path
+from app_paths import resolve_resource_path, get_model_storage_dir
 # ui_config imports removed - using simple icon="icon.png" instead
 from hotkey_manager import HotkeyManager
 from audio_manager import AudioManager
@@ -446,7 +446,7 @@ class DictationApp(rumps.App):
         )
 
         # Silence detection settings for auto-send (loaded from settings manager)
-        self.silence_threshold = 150  # RMS level below which audio is considered silence (constant)
+        self.silence_threshold = self.settings_manager.get_silence_threshold()
         self.silence_auto_stop_enabled = self.settings_manager.get_silence_auto_stop_enabled()
         self.silence_duration = self.settings_manager.get_silence_duration()
         self.skip_edit_window = self.settings_manager.get_skip_edit_window()
@@ -476,30 +476,22 @@ class DictationApp(rumps.App):
             caller_context="app_init"
         )
 
-        # Determine model path based on whether we're running from a bundle or source
-        if getattr(sys, "frozen", False):
-            # Running inside YardTalk.app - model is in Resources
-            bundle_root = pathlib.Path(sys.executable).resolve().parents[1]  # .../Contents
-            resources_dir = bundle_root / "Resources"
-            model_path = find_parakeet_model(resources_dir)
-        else:
-            # Running from source - search current directory for parakeet-tdt-* folder
-            model_path = find_parakeet_model(".")
+        # Find or download the ASR model
+        model_path = self._find_model()
+        self._download_window = None
+        self._model_downloader = None
 
-        if not model_path:
-            print("MAIN_APP: ERROR - No Parakeet model found! Please download a parakeet-tdt model.")
-            model_path = None  # Will trigger error in ASRService
-        else:
+        if model_path:
             print(f"MAIN_APP: Using model path: {model_path}")
-        self.asr_service = ASRService(model_path=model_path, result_callback=self._handle_asr_service_result)
-
-        # Initialize live transcription service for preview during recording
-        # Note: Currently disabled by default - can be enabled in settings later
-        self.live_transcription_enabled = False  # Toggle for live preview feature
-        self.live_transcription_service = LiveTranscriptionService(
-            asr_service=self.asr_service,
-            on_preview=self._on_live_preview
-        )
+            self._init_asr_service(model_path)
+        else:
+            print("MAIN_APP: No Parakeet model found — will download on first launch")
+            self.asr_service = None
+            self.asr_model_status = "downloading"
+            self.live_transcription_enabled = False
+            self.live_transcription_service = None
+            self.update_menu_state()
+            self._start_model_download()
 
         # Check and request accessibility permissions before initializing hotkey manager
         self._check_and_request_accessibility()
@@ -530,6 +522,115 @@ class DictationApp(rumps.App):
         rumps.Timer(self._setup_app_menu, 0.5).start()
 
         # Initial menu state is set above, will be updated by ASR callback
+
+    def _find_model(self):
+        """Search for an existing Parakeet model file.
+
+        Search order:
+        1. Current directory (source/dev mode)
+        2. ~/Library/Application Support/YardTalk/
+        3. Bundle Contents/Resources/ (backwards compat)
+        """
+        # 1. Source / dev mode
+        if not getattr(sys, "frozen", False):
+            result = find_parakeet_model(".")
+            if result:
+                return result
+
+        # 2. Application Support
+        storage = get_model_storage_dir()
+        result = find_parakeet_model(storage)
+        if result:
+            return result
+
+        # 3. Bundle Resources
+        if getattr(sys, "frozen", False):
+            bundle_root = pathlib.Path(sys.executable).resolve().parents[1]
+            result = find_parakeet_model(bundle_root / "Resources")
+            if result:
+                return result
+
+        return None
+
+    def _init_asr_service(self, model_path):
+        """Create the ASRService and LiveTranscriptionService from a model path."""
+        self.asr_service = ASRService(
+            model_path=model_path,
+            result_callback=self._handle_asr_service_result,
+        )
+        self.live_transcription_enabled = False
+        self.live_transcription_service = LiveTranscriptionService(
+            asr_service=self.asr_service,
+            on_preview=self._on_live_preview,
+        )
+
+    def _start_model_download(self):
+        """Show the download window and begin downloading the model."""
+        from model_downloader import ModelDownloader
+        from download_window import DownloadProgressWindow
+
+        storage = get_model_storage_dir()
+
+        self._download_window = DownloadProgressWindow(
+            on_cancel=self._on_download_cancel,
+            on_retry=self._on_download_retry,
+        )
+        self._download_window.show()
+
+        self._model_downloader = ModelDownloader(
+            dest_dir=storage,
+            on_progress=self._on_download_progress,
+            on_complete=self._on_model_downloaded,
+            on_error=self._on_download_error,
+        )
+        self._model_downloader.start()
+
+    def _on_download_progress(self, downloaded, total, speed_bps):
+        if self._download_window:
+            self._download_window.update_progress(downloaded, total, speed_bps)
+
+    def _on_model_downloaded(self, model_path):
+        """Called on main thread when the model download finishes."""
+        print(f"MAIN_APP: Model downloaded to {model_path}")
+        if self._download_window:
+            self._download_window.close()
+            self._download_window = None
+        self._model_downloader = None
+
+        self._init_asr_service(model_path)
+        self.asr_model_status = "initializing"
+        self.update_menu_state()
+
+    def _on_download_cancel(self):
+        """User confirmed cancellation of the download."""
+        print("MAIN_APP: Download cancelled by user — quitting")
+        if self._model_downloader:
+            self._model_downloader.cancel()
+            self._model_downloader = None
+        if self._download_window:
+            self._download_window.close()
+            self._download_window = None
+        rumps.quit_application()
+
+    def _on_download_error(self, msg):
+        """Download failed — show error in the download window."""
+        print(f"MAIN_APP: Download error: {msg}")
+        if self._download_window:
+            self._download_window.show_error(msg)
+
+    def _on_download_retry(self):
+        """User clicked Retry after a download error."""
+        print("MAIN_APP: Retrying model download")
+        from model_downloader import ModelDownloader
+
+        storage = get_model_storage_dir()
+        self._model_downloader = ModelDownloader(
+            dest_dir=storage,
+            on_progress=self._on_download_progress,
+            on_complete=self._on_model_downloaded,
+            on_error=self._on_download_error,
+        )
+        self._model_downloader.start()
 
     def _check_and_request_accessibility(self):
         """Check accessibility permissions and prompt user if needed."""
@@ -583,6 +684,10 @@ class DictationApp(rumps.App):
         # Don't start twice
         if self._hotkeys_started:
             timer.stop()
+            return
+
+        # While downloading, don't start hotkeys yet — wait for model to finish
+        if self.asr_model_status == "downloading":
             return
 
         # Check if both subsystems are ready (or one has errored but we should still allow hotkeys)
@@ -775,7 +880,7 @@ class DictationApp(rumps.App):
             print("MAIN_APP: WARNING - overlay_window is None, can't add chunk")
 
         # Feed to live transcription service if active
-        if self.live_transcription_service.is_active:
+        if self.live_transcription_service and self.live_transcription_service.is_active:
             self.live_transcription_service.add_audio_chunk(chunk)
 
         # Silence detection for auto-send (only if enabled)
@@ -1048,6 +1153,12 @@ class DictationApp(rumps.App):
             return
 
         # Check ASR model status
+        if self.asr_model_status == "downloading":
+            rumps.notification("Downloading Model", "The speech model is still downloading.", "Please wait for the download to finish.")
+            if self.hotkey_manager.hotkey_active:
+                self.hotkey_manager.hotkey_active = False
+            print(f"MAIN_APP ({log_id}): Model downloading, returning.")
+            return
         if self.asr_model_status == "initializing":
             rumps.notification("Initializing", "ASR model is loading...", "Please try again in a moment.")
             if self.hotkey_manager.hotkey_active:
@@ -1167,15 +1278,15 @@ class DictationApp(rumps.App):
         self.audio_manager.stop_recording(f"from_deactivate_active_{log_id}")
 
         # Stop live transcription if active
-        if self.live_transcription_service.is_active:
+        if self.live_transcription_service and self.live_transcription_service.is_active:
             print(f"MAIN_APP ({log_id}): Stopping live transcription service...")
             self.live_transcription_service.stop()
 
         if self.overlay_window:
-            # Disable live preview before hiding
+            # Disable live preview and switch to processing mode
             if self.overlay_window.live_preview_enabled:
                 AppHelper.callAfter(self.overlay_window.set_live_preview_enabled, False)
-            AppHelper.callAfter(self.overlay_window.hide)
+            AppHelper.callAfter(self.overlay_window.show_processing)
         print(f"MAIN_APP ({log_id}): Audio recording stopped call returned.")
 
         if self.is_transcribing:
@@ -1188,6 +1299,9 @@ class DictationApp(rumps.App):
         audio_to_transcribe = self.asr_service.get_buffered_audio_and_clear()
         if audio_to_transcribe.size == 0:
             print(f"MAIN_APP ({log_id}): Deactivation - Audio buffer is empty. Nothing to transcribe.")
+            # Hide overlay since there's nothing to process
+            if self.overlay_window:
+                AppHelper.callAfter(self.overlay_window.hide)
             rumps.notification("Dictation Stopped", "No audio recorded.", "")
             # If nothing to transcribe, ensure hotkey_active is False if it was True from the deactivation press
             if self.hotkey_manager.hotkey_active:
@@ -1230,7 +1344,9 @@ class DictationApp(rumps.App):
         asr_initializing = self.asr_model_status == "initializing"
         audio_initializing = self.audio_subsystem_status == "initializing"
 
-        if asr_initializing and audio_initializing:
+        if self.asr_model_status == "downloading":
+            menu_item_title = "Downloading Model..."
+        elif asr_initializing and audio_initializing:
             menu_item_title = "Initializing..."
         elif asr_initializing:
             menu_item_title = "Loading ASR Model..."
@@ -1409,25 +1525,39 @@ class DictationApp(rumps.App):
         if not target_likely_text:
             print(f"MAIN_APP ({log_id}): Skipping keyboard insertion - target not text-accepting")
             show_toast("Text Copied", "Press Cmd+V to paste")
+            self._last_transcribed_text = formatted_text
+            self._finish_transcription_cycle()
         else:
-            try:
-                insertion_result = self.text_insertion_service.insert_text(formatted_text)
-                if insertion_result:
-                    char_count = len(formatted_text)
-                    msg = f"Inserted {char_count} characters"
-                    if target_app_name:
-                        msg += f" into {target_app_name}"
-                    show_toast("Transcription Complete", msg)
-                else:
-                    rumps.notification("Insertion Failed",
-                        "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
-            except Exception as e:
-                print(f"MAIN_APP ({log_id}): Error during text insertion: {e}")
-                rumps.notification("Insertion Error",
-                    "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
+            # Run text insertion in background thread so overlay animation continues
+            def insert_in_background():
+                try:
+                    insertion_result = self.text_insertion_service.insert_text(formatted_text)
+                    # Dispatch result handling back to main thread
+                    def on_complete():
+                        if insertion_result:
+                            char_count = len(formatted_text)
+                            msg = f"Inserted {char_count} characters"
+                            if target_app_name:
+                                msg += f" into {target_app_name}"
+                            show_toast("Transcription Complete", msg)
+                        else:
+                            rumps.notification("Insertion Failed",
+                                "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
+                        self._last_transcribed_text = formatted_text
+                        self._finish_transcription_cycle()
+                    AppHelper.callAfter(on_complete)
+                except Exception as e:
+                    print(f"MAIN_APP ({log_id}): Error during text insertion: {e}")
+                    def on_error():
+                        rumps.notification("Insertion Error",
+                            "Text copied to clipboard. Press Cmd+V to paste.", formatted_text[:50])
+                        self._last_transcribed_text = formatted_text
+                        self._finish_transcription_cycle()
+                    AppHelper.callAfter(on_error)
 
-        self._last_transcribed_text = formatted_text
-        self._finish_transcription_cycle()
+            import threading
+            insertion_thread = threading.Thread(target=insert_in_background, daemon=True)
+            insertion_thread.start()
 
     def _on_correction_send(self, original_text: str, corrected_text: str):
         """Called when user confirms corrected text in the correction window."""
@@ -1526,8 +1656,10 @@ class DictationApp(rumps.App):
         audio_is_recording = getattr(self.audio_manager, "_is_recording", False)
         if audio_is_recording:
             self.audio_manager.stop_recording("from_finish_transcription_cycle")
-            if self.overlay_window:
-                AppHelper.callAfter(self.overlay_window.hide)
+
+        # Hide the overlay window (it may still be showing processing indicator)
+        if self.overlay_window:
+            AppHelper.callAfter(self.overlay_window.hide)
 
         self.update_menu_state()
 
@@ -1536,7 +1668,10 @@ class DictationApp(rumps.App):
         """Manual toggle for dictation - useful when hotkeys aren't working"""
         print(f"MAIN_APP: Manual toggle dictation clicked. dictation_active={self.dictation_active}, hotkey_active={self.hotkey_manager.hotkey_active}, is_transcribing={self.is_transcribing}")
 
-        if self.asr_model_status == "initializing":
+        if self.asr_model_status == "downloading":
+            rumps.notification("Downloading Model", "The speech model is still downloading.", "Please wait for the download to finish.")
+            return
+        elif self.asr_model_status == "initializing":
             rumps.notification("ASR Not Ready", "Model is still initializing.", "Please wait.")
             return
         elif self.asr_model_status == "error":
@@ -1644,22 +1779,34 @@ class DictationApp(rumps.App):
         self.silence_auto_stop_enabled = self.settings_manager.get_silence_auto_stop_enabled()
         self.silence_duration = self.settings_manager.get_silence_duration()
         self.skip_edit_window = self.settings_manager.get_skip_edit_window()
+        self.silence_threshold = self.settings_manager.get_silence_threshold()
         print(f"MAIN_APP: Settings updated - silence_auto_stop={self.silence_auto_stop_enabled}, "
-              f"silence_duration={self.silence_duration}, skip_edit={self.skip_edit_window}")
+              f"silence_duration={self.silence_duration}, skip_edit={self.skip_edit_window}, "
+              f"silence_threshold={self.silence_threshold}")
 
     @rumps.clicked("Quit")
     def quit_app(self, _):
         print("MAIN_APP: Quit clicked.")
+
+        # Cancel any in-progress model download
+        if self._model_downloader:
+            print("MAIN_APP: Quit - Cancelling model download...")
+            self._model_downloader.cancel()
+            self._model_downloader = None
+        if self._download_window:
+            self._download_window.close()
+            self._download_window = None
+
         if self.dictation_active:
             print("MAIN_APP: Quit - Dictation was active, stopping audio manager...")
             self.audio_manager.stop_recording()
             if self.overlay_window:
                 self.overlay_window.hide()
-        
+
         print("MAIN_APP: Quit - Shutting down ASR service...")
         if self.asr_service: # Check if ASR service was initialized
             self.asr_service.shutdown() # Signal worker thread to stop
-        
+
         print("MAIN_APP: Quit - Stopping hotkey manager.")
         if self.hotkey_manager: # Check if hotkey manager was initialized
             self.hotkey_manager.stop_listening()
